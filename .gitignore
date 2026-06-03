@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+
+# Data & secrets (never commit live trading credentials)
+*.csv
+*.parquet
+*.feather
+data/
+secrets/
+credentials.json
+*.pem
+
+# IDE / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Backtest / logs
+logs/
+output/
+*.log
+
+# Jupyter
+.ipynb_checkpoints/

@@ -1,13 +1,18 @@
 """
 Production backtest engine for TT-exported ZN quote CSV.
 Stdlib only: csv, pathlib, dataclasses.
+
+Net P&L is accumulated line-by-line per fill:
+  net_fill = gross_price_pnl - fee_usd   (fee = $0.50 per lot per side)
+Round-turn on 1 lot = $1.00 total fees when both legs are charged.
 """
 
 from __future__ import annotations
 
 import csv
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
+
 from pathlib import Path
 
 from zn_competition.economics import FeeAccounting, analyze_week_plan
@@ -15,7 +20,11 @@ from zn_competition.execution import execute_signal
 from zn_competition.features import MicrostructureFeatureEngine
 from zn_competition.microstructure import Quote, order_book_from_quote
 from zn_competition.risk import PositionLedger, RiskState
-from zn_competition.specs import WEEKLY_VOLUME_MIN, weekly_volume_requirement
+from zn_competition.specs import (
+    FEE_PER_LOT_PER_SIDE_USD,
+    FEE_PER_LOT_ROUND_TURN_USD,
+    weekly_volume_requirement,
+)
 from zn_competition.strategies.base import StrategyContext
 from zn_competition.strategies.engine import StrategyStack
 
@@ -36,23 +45,66 @@ OPTIONAL_COLUMNS = frozenset(
 
 
 @dataclass(frozen=True)
+class FillPnLLine:
+    """Per-fill P&L attribution (one exchange leg)."""
+
+    index: int
+    timestamp: str
+    reason: str
+    side: str
+    lots: int
+    price: float
+    gross_pnl_usd: float
+    fee_usd: float
+    net_pnl_usd: float
+    position_after: int
+    cumulative_net_pnl_usd: float
+
+
+@dataclass(frozen=True)
 class BacktestResult:
     week: int
     leg_lots_traded: int
     weekly_min_legs: int
     met_volume_min: bool
     position_end: int
-    realized_pnl_usd: float
+    gross_pnl_usd: float
     total_fees_usd: float
+    realized_pnl_usd: float
     mark_pnl_usd: float
     net_pnl_usd: float
     fill_count: int
     halted: bool
     halt_reason: str
     signals_by_reason: dict[str, int]
+    pnl_lines: tuple[FillPnLLine, ...] = field(default_factory=tuple)
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2)
+
+    def verify_fee_schedule(self) -> None:
+        """Assert fees match $0.50 × leg count."""
+        expected = self.leg_lots_traded * FEE_PER_LOT_PER_SIDE_USD
+        if abs(self.total_fees_usd - expected) > 0.001:
+            raise ValueError(
+                f"fee mismatch: total_fees={self.total_fees_usd} "
+                f"expected={expected}"
+            )
+
+    def verify_net_pnl_identity(self) -> None:
+        """Net = realized (per-fill net sum) + open-position mark."""
+        expected = self.realized_pnl_usd + self.mark_pnl_usd
+        if abs(self.net_pnl_usd - expected) > 0.001:
+            raise ValueError(
+                f"net mismatch: net={self.net_pnl_usd} expected={expected}"
+            )
+        if self.pnl_lines:
+            line_sum = sum(line.net_pnl_usd for line in self.pnl_lines)
+            if abs(line_sum - self.realized_pnl_usd) > 0.01:
+                raise ValueError(
+                    f"realized mismatch: ledger={self.realized_pnl_usd} "
+                    f"lines={line_sum}"
+                )
 
 
 def _parse_float(row: dict[str, str], key: str, default: float | None = None) -> float:
@@ -120,6 +172,33 @@ def _row_event_fields(row: dict[str, str]) -> tuple[str | None, str | None, floa
     return tag, phase, surprise
 
 
+def _record_fill_pnl(
+    ledger: PositionLedger,
+    fill_index: int,
+    net_this_fill: float,
+    fee_usd: float,
+    pnl_lines: list[FillPnLLine],
+) -> None:
+    """Append one line-level P&L row after ``ledger.apply_fill``."""
+    last = ledger.fills[-1]
+    gross = net_this_fill + fee_usd
+    pnl_lines.append(
+        FillPnLLine(
+            index=fill_index,
+            timestamp=last.timestamp,
+            reason=last.reason,
+            side=last.side.value,
+            lots=last.lots,
+            price=last.price,
+            gross_pnl_usd=gross,
+            fee_usd=fee_usd,
+            net_pnl_usd=net_this_fill,
+            position_after=ledger.position,
+            cumulative_net_pnl_usd=ledger.realized_pnl_usd,
+        )
+    )
+
+
 def run_backtest(
     quotes: list[Quote],
     week: int = 1,
@@ -133,17 +212,19 @@ def run_backtest(
         raise ValueError("quotes list is empty")
 
     weekly_min = weekly_volume_requirement(week)
-    engine = MicrostructureFeatureEngine()
+    feature_engine = MicrostructureFeatureEngine()
     strategy_stack = stack or StrategyStack()
     ledger = PositionLedger()
     risk = RiskState(daily_loss_limit_usd=daily_loss_limit_usd)
     signals_by_reason: dict[str, int] = {}
+    pnl_lines: list[FillPnLLine] = []
+    fill_index = 0
 
     for idx, quote in enumerate(quotes):
         if risk.halted:
             break
 
-        features = engine.update(quote)
+        features = feature_engine.update(quote)
         tag, phase, surprise = (None, None, None)
         if event_rows and idx < len(event_rows):
             tag, phase, surprise = _row_event_fields(event_rows[idx])
@@ -178,28 +259,35 @@ def run_backtest(
         if fill is None:
             continue
 
-        net = ledger.apply_fill(fill)
-        risk.apply_realized(net)
+        net_this_fill = ledger.apply_fill(fill)
+        _record_fill_pnl(ledger, fill_index, net_this_fill, fill.fee_usd, pnl_lines)
+        fill_index += 1
+        risk.apply_realized(net_this_fill)
 
-    mark = quotes[-1].mid
-    mark_pnl = ledger.mark_price_pnl_usd(mark)
+    mark_pnl = ledger.mark_price_pnl_usd(quotes[-1].mid)
+    gross_realized = ledger.realized_pnl_usd + ledger.total_fees_usd
     net_total = ledger.realized_pnl_usd + mark_pnl
 
-    return BacktestResult(
+    result = BacktestResult(
         week=week,
         leg_lots_traded=ledger.leg_lots_traded,
         weekly_min_legs=weekly_min,
         met_volume_min=ledger.leg_lots_traded >= weekly_min,
         position_end=ledger.position,
-        realized_pnl_usd=round(ledger.realized_pnl_usd, 2),
+        gross_pnl_usd=round(gross_realized, 2),
         total_fees_usd=round(ledger.total_fees_usd, 2),
+        realized_pnl_usd=round(ledger.realized_pnl_usd, 2),
         mark_pnl_usd=round(mark_pnl, 2),
         net_pnl_usd=round(net_total, 2),
         fill_count=len(ledger.fills),
         halted=risk.halted,
         halt_reason=risk.halt_reason,
         signals_by_reason=signals_by_reason,
+        pnl_lines=tuple(pnl_lines),
     )
+    result.verify_fee_schedule()
+    result.verify_net_pnl_identity()
+    return result
 
 
 def run_backtest_csv(path: Path, week: int = 1) -> BacktestResult:
@@ -242,7 +330,10 @@ if __name__ == "__main__":
     import sys
 
     if len(sys.argv) > 1:
-        result = run_backtest_csv(Path(sys.argv[1]), week=int(sys.argv[2]) if len(sys.argv) > 2 else 1)
+        result = run_backtest_csv(
+            Path(sys.argv[1]),
+            week=int(sys.argv[2]) if len(sys.argv) > 2 else 1,
+        )
     else:
         synthetic = generate_synthetic_quotes()
         result = run_backtest(synthetic, week=1)
@@ -250,3 +341,9 @@ if __name__ == "__main__":
     plan = analyze_week_plan(1, result.leg_lots_traded)
     print("week_plan:", plan)
     print("fee_accounting:", asdict(FeeAccounting(result.leg_lots_traded)))
+    print(
+        f"fee_per_rt_check: {result.leg_lots_traded} legs, "
+        f"${result.total_fees_usd} fees "
+        f"(expected ${result.leg_lots_traded * FEE_PER_LOT_PER_SIDE_USD}, "
+        f"RT=${FEE_PER_LOT_ROUND_TURN_USD}/lot)"
+    )

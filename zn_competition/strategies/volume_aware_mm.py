@@ -315,14 +315,14 @@ class OrderBookImbalanceHFT:
             return None
 
         if order.side == Side.BUY:
-            if ZN_SEP26.round_price_to_tick(quote.bid) != order.limit_price:
+            if abs(ZN_SEP26.round_price_to_tick(quote.bid) - order.limit_price) > 1e-9:
                 return None
-            if obi <= self.entry_threshold:
+            if obi < self.entry_threshold:
                 return None
         elif order.side == Side.SELL:
-            if ZN_SEP26.round_price_to_tick(quote.ask) != order.limit_price:
+            if abs(ZN_SEP26.round_price_to_tick(quote.ask) - order.limit_price) > 1e-9:
                 return None
-            if obi >= self.short_entry_threshold:
+            if obi > self.short_entry_threshold:
                 return None
         else:
             return None

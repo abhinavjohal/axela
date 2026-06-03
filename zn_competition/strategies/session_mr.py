@@ -145,13 +145,25 @@ class VolumeChurner:
     def weekly_requirement(self, week_number: int) -> int:
         return weekly_volume_requirement(week_number)
 
-    def weekly_quota_satisfied(self, ctx: StrategyContext) -> bool:
+    def _legs_traded_this_week(self, ctx: StrategyContext, ledger: PositionLedger) -> int:
+        return max(ctx.leg_lots_traded_this_week, ledger.leg_lots_traded)
+
+    def weekly_quota_satisfied(
+        self,
+        ctx: StrategyContext,
+        ledger: PositionLedger | None = None,
+    ) -> bool:
         if ctx.weekly_min_remaining <= 0:
             return True
         required = self.weekly_requirement(ctx.week_number)
-        return ctx.leg_lots_traded_this_week >= required
+        legs = (
+            self._legs_traded_this_week(ctx, ledger)
+            if ledger is not None
+            else ctx.leg_lots_traded_this_week
+        )
+        return legs >= required
 
-    def competition_quota_satisfied(self, ctx: StrategyContext) -> int:
+    def competition_quota_satisfied(self, ctx: StrategyContext) -> bool:
         return ctx.leg_lots_traded_total >= TOTAL_VOLUME_MIN
 
     def should_run(self, ctx: StrategyContext) -> bool:
@@ -196,14 +208,15 @@ class VolumeChurner:
         legs both count). Stops placing new quotes when the week minimum is satisfied.
         """
         required = self.weekly_requirement(ctx.week_number)
-        remaining = max(0, required - ctx.leg_lots_traded_this_week)
+        legs_done = self._legs_traded_this_week(ctx, ledger)
+        remaining = max(0, required - legs_done)
         result = ChurnStepResult(
             weekly_requirement=required,
             weekly_legs_remaining=remaining,
             legs_executed_total=self._session_legs_executed,
         )
 
-        if self.weekly_quota_satisfied(ctx) or self.competition_quota_satisfied(ctx):
+        if self.weekly_quota_satisfied(ctx, ledger) or self.competition_quota_satisfied(ctx):
             self._enabled = False
             self._bid_working = None
             self._ask_working = None
@@ -276,7 +289,7 @@ class VolumeChurner:
         else:
             result.action = "quotes_working"
 
-        result.active = self._enabled and not self.weekly_quota_satisfied(ctx)
+        result.active = self._enabled and not self.weekly_quota_satisfied(ctx, ledger)
         self._sync_quota(result, ctx, ledger)
         result.legs_executed_total = self._session_legs_executed
         return result
@@ -290,7 +303,7 @@ class VolumeChurner:
         ctx: StrategyContext,
         ledger: PositionLedger,
     ) -> None:
-        traded = ledger.leg_lots_traded
+        traded = self._legs_traded_this_week(ctx, ledger)
         required = self.weekly_requirement(ctx.week_number)
         result.weekly_legs_remaining = max(0, required - traded)
         if traded >= required or ctx.weekly_min_remaining <= 0:
@@ -312,14 +325,14 @@ class VolumeChurner:
             return None
 
         if side == Side.BUY:
-            if ZN_SEP26.round_price_to_tick(quote.bid) != order.limit_price:
+            if abs(ZN_SEP26.round_price_to_tick(quote.bid) - order.limit_price) > 1e-9:
                 return None
             lots = clip_order_size(order.lots, ledger.position)
             if lots <= 0:
                 return None
             validate_order(ledger.position, OrderRequest(Side.BUY, lots, order.reason))
         else:
-            if ZN_SEP26.round_price_to_tick(quote.ask) != order.limit_price:
+            if abs(ZN_SEP26.round_price_to_tick(quote.ask) - order.limit_price) > 1e-9:
                 return None
             lots = clip_order_size(order.lots, ledger.position)
             if lots <= 0:

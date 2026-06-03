@@ -1,5 +1,7 @@
 """
 Competition PnL vs volume economics — fees at $0.50/side, $1.00 round-turn.
+
+Canonical trade P&L: net_pnl_from_tick_move()
 """
 
 from __future__ import annotations
@@ -10,10 +12,143 @@ from zn_competition.specs import (
     DOLLARS_PER_TICK,
     FEE_PER_LOT_PER_SIDE_USD,
     FEE_PER_LOT_ROUND_TURN_USD,
+    MAX_POSITION_LOTS,
     TOTAL_VOLUME_MIN,
     WEEKLY_VOLUME_MIN,
     ZN_SEP26,
 )
+
+
+def validate_trade_lots(
+    lots: int,
+    *,
+    position_before: int = 0,
+    signed_lot_delta: int | None = None,
+) -> None:
+    """
+    Enforce competition position cap (10 lots absolute).
+
+    Parameters
+    ----------
+    lots:
+        Contracts in the order (must be 1–10).
+    position_before:
+        Signed position before the order (+ long, − short).
+    signed_lot_delta:
+        Change in position from this order (+buy size, −sell size).
+        When provided, checks |position_before + signed_lot_delta| <= 10.
+    """
+    if isinstance(lots, bool) or not isinstance(lots, int):
+        raise TypeError(f"lots must be int, got {type(lots).__name__}")
+    if lots < 1 or lots > MAX_POSITION_LOTS:
+        raise ValueError(
+            f"lots must be between 1 and {MAX_POSITION_LOTS} (inclusive), got {lots}"
+        )
+    if isinstance(position_before, bool) or not isinstance(position_before, int):
+        raise TypeError(
+            f"position_before must be int, got {type(position_before).__name__}"
+        )
+    if abs(position_before) > MAX_POSITION_LOTS:
+        raise ValueError(
+            f"|position_before| cannot exceed {MAX_POSITION_LOTS}, got {position_before}"
+        )
+    if signed_lot_delta is None:
+        return
+    if not isinstance(signed_lot_delta, int) or isinstance(signed_lot_delta, bool):
+        raise TypeError("signed_lot_delta must be int")
+    if abs(signed_lot_delta) != lots:
+        raise ValueError(
+            f"|signed_lot_delta| must equal lots ({lots}), got {signed_lot_delta}"
+        )
+    projected = position_before + signed_lot_delta
+    if abs(projected) > MAX_POSITION_LOTS:
+        raise ValueError(
+            f"order breaches position cap: {position_before} -> {projected} "
+            f"(max absolute position {MAX_POSITION_LOTS})"
+        )
+
+
+@dataclass(frozen=True)
+class TradePnLBreakdown:
+    """Exact ZN Sep26 P&L from a tick price move after per-side fees."""
+
+    tick_move: float
+    lots: int
+    sides: int
+    gross_pnl_usd: float
+    fees_usd: float
+    net_pnl_usd: float
+    dollars_per_tick: float = DOLLARS_PER_TICK
+    fee_per_side_usd: float = FEE_PER_LOT_PER_SIDE_USD
+
+    @property
+    def fee_per_lot_round_turn_usd(self) -> float:
+        return self.sides * self.fee_per_side_usd
+
+
+def net_pnl_from_tick_move(
+    tick_move: float,
+    lots: int,
+    *,
+    sides: int = 2,
+    position_before: int = 0,
+    signed_lot_delta: int | None = None,
+) -> TradePnLBreakdown:
+    """
+    Net P&L in USD for a ZN Sep26 move expressed in ticks.
+
+    Pricing
+    -------
+    - Tick size: 1/64 point (0.015625)
+    - Tick value: $15.625 per contract per tick
+    - Fee: $0.50 per lot per exchange side
+    - Default ``sides=2``: round-turn (entry + exit) → $1.00/lot total fees
+
+    Parameters
+    ----------
+    tick_move:
+        Signed move in ticks. Positive = favorable to a **long**
+        (ZN price up). For a short, pass the negated move.
+    lots:
+        Contracts traded (1–10). Validated against the 10-lot position cap.
+    sides:
+        Exchange legs charged at $0.50/lot each: ``1`` (single fill) or ``2`` (RT).
+    position_before:
+        Signed position before the trade; used with ``signed_lot_delta``.
+    signed_lot_delta:
+        Position change from this trade (+lots for buy, −lots for sell).
+        When set, verifies the post-trade position stays within ±10 lots.
+
+    Returns
+    -------
+    TradePnLBreakdown
+        gross = tick_move × $15.625 × lots
+        fees  = lots × sides × $0.50
+        net   = gross − fees
+    """
+    if not isinstance(tick_move, (int, float)) or isinstance(tick_move, bool):
+        raise TypeError(f"tick_move must be numeric, got {type(tick_move).__name__}")
+    if sides not in (1, 2):
+        raise ValueError(f"sides must be 1 or 2, got {sides}")
+
+    validate_trade_lots(
+        lots,
+        position_before=position_before,
+        signed_lot_delta=signed_lot_delta,
+    )
+
+    gross = ZN_SEP26.gross_pnl_usd(float(tick_move), lots)
+    fees = ZN_SEP26.fee_for_legs(lots, sides=sides)
+    net = gross - fees
+
+    return TradePnLBreakdown(
+        tick_move=float(tick_move),
+        lots=lots,
+        sides=sides,
+        gross_pnl_usd=gross,
+        fees_usd=fees,
+        net_pnl_usd=net,
+    )
 
 
 @dataclass(frozen=True)
@@ -130,14 +265,15 @@ def four_week_fee_budget(zn_leg_counts: list[int] | None = None) -> dict[str, ob
 
 def minimum_gross_ticks_for_target_net(
     target_net_usd: float,
-    leg_lots: int,
+    lots: int,
+    *,
+    sides: int = 2,
 ) -> float:
-    """Gross ticks required across leg_lots so net = target after $0.50/side fees."""
-    if leg_lots <= 0:
-        raise ValueError(f"leg_lots must be positive, got {leg_lots}")
-    fees = ZN_SEP26.fee_for_legs(leg_lots, 1)
+    """Tick move required so net_pnl_from_tick_move() equals target_net_usd."""
+    validate_trade_lots(lots)
+    fees = ZN_SEP26.fee_for_legs(lots, sides=sides)
     required_gross_usd = target_net_usd + fees
-    return ZN_SEP26.dollars_to_ticks(required_gross_usd, lots=leg_lots)
+    return required_gross_usd / (DOLLARS_PER_TICK * lots)
 
 
 if __name__ == "__main__":
@@ -146,3 +282,10 @@ if __name__ == "__main__":
         print(row)
     print("\n=== 4-week fee budget (2000 legs on ZN) ===")
     print(four_week_fee_budget())
+    print("\n=== Trade P&L examples ===")
+    print(net_pnl_from_tick_move(1.0, 1))  # +1 tick, 1 lot, round-turn
+    print(net_pnl_from_tick_move(3.0, 5))
+    try:
+        net_pnl_from_tick_move(1.0, 11)
+    except ValueError as exc:
+        print(f"cap rejected: {exc}")

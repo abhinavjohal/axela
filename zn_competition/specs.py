@@ -59,42 +59,47 @@ class ZNContract:
     def price_delta_to_ticks(self, price_delta: float) -> float:
         return price_delta / TICK_SIZE_FLOAT
 
+    def gross_pnl_usd(self, tick_move: float, lots: int) -> float:
+        """
+        Gross P&L from a signed tick move.
+        Positive tick_move = price moved in favor of a long (ZN up -> long wins).
+        """
+        if lots < 1:
+            raise ValueError(f"lots must be >= 1, got {lots}")
+        return tick_move * self.dollars_per_tick * lots
+
     def ticks_to_dollars(self, ticks: float, lots: int = 1) -> float:
-        if lots < 0:
-            raise ValueError(f"lots must be non-negative, got {lots}")
-        return ticks * self.dollars_per_tick * lots
+        return self.gross_pnl_usd(ticks, lots)
 
     def dollars_to_ticks(self, dollars: float, lots: int = 1) -> float:
         if lots <= 0:
             raise ValueError(f"lots must be positive, got {lots}")
         return dollars / (self.dollars_per_tick * lots)
 
-    def fee_for_legs(self, lots: int, legs: int = 1) -> float:
-        if lots < 0 or legs < 0:
-            raise ValueError(f"lots and legs must be non-negative, got {lots}, {legs}")
-        return lots * legs * self.fee_per_side
+    def fee_for_legs(self, lots: int, sides: int = 1) -> float:
+        """Total fees for `sides` exchange legs (1=single fill, 2=round-turn)."""
+        if lots < 1:
+            raise ValueError(f"lots must be >= 1, got {lots}")
+        if sides < 1 or sides > 2:
+            raise ValueError(f"sides must be 1 or 2, got {sides}")
+        return lots * sides * self.fee_per_side
 
     def fee_for_round_turn(self, lots: int) -> float:
-        if lots < 0:
-            raise ValueError(f"lots must be non-negative, got {lots}")
-        return lots * self.fee_round_turn
+        return self.fee_for_legs(lots, sides=2)
 
-    def fee_as_ticks(self, lots: int, legs: int = 1) -> float:
-        """Exchange fees expressed in price ticks (per leg batch)."""
-        if lots <= 0:
-            return 0.0
-        return self.dollars_to_ticks(self.fee_for_legs(lots, legs), lots=1) / lots
+    def fee_as_ticks(self, lots: int, sides: int = 1) -> float:
+        """Per-lot fee expressed in price ticks for one leg or round-turn."""
+        if lots < 1:
+            raise ValueError(f"lots must be >= 1, got {lots}")
+        if sides == 1:
+            return self.fee_per_side / self.dollars_per_tick
+        if sides == 2:
+            return self.fee_round_turn / self.dollars_per_tick
+        raise ValueError(f"sides must be 1 or 2, got {sides}")
 
-    def net_pnl_usd(
-        self,
-        ticks: float,
-        lots: int,
-        legs_traded: int,
-    ) -> float:
-        """Gross tick PnL minus per-side fees for legs_traded (1=open, 2=round-turn)."""
-        gross = self.ticks_to_dollars(ticks, lots)
-        fees = self.fee_for_legs(lots, legs_traded)
-        return gross - fees
+    def net_pnl_usd(self, tick_move: float, lots: int, sides: int = 2) -> float:
+        """Gross tick P&L minus $0.50/lot/side × sides (default 2 = round-turn)."""
+        return self.gross_pnl_usd(tick_move, lots) - self.fee_for_legs(lots, sides)
 
 
 ZN_SEP26 = ZNContract()

@@ -5,7 +5,13 @@ from __future__ import annotations
 import unittest
 
 from zn_competition.backtest import generate_synthetic_quotes, run_backtest
-from zn_competition.economics import FeeAccounting, four_week_fee_budget
+from zn_competition.economics import (
+    FeeAccounting,
+    four_week_fee_budget,
+    net_pnl_from_tick_move,
+    validate_trade_lots,
+)
+from zn_competition.specs import MAX_POSITION_LOTS
 from zn_competition.execution import execute_signal
 from zn_competition.microstructure import Quote
 from zn_competition.risk import FillRecord, OrderRequest, PositionLedger, clip_order_size, validate_order
@@ -32,6 +38,52 @@ class TestZNConstants(unittest.TestCase):
     def test_round_price(self) -> None:
         p = ZN_SEP26.round_price_to_tick(112.015625)
         self.assertAlmostEqual(p, 112.015625)
+
+
+class TestNetPnLFromTickMove(unittest.TestCase):
+    def test_one_tick_one_lot_round_turn(self) -> None:
+        result = net_pnl_from_tick_move(1.0, 1, sides=2)
+        self.assertAlmostEqual(result.gross_pnl_usd, DOLLARS_PER_TICK)
+        self.assertAlmostEqual(result.fees_usd, FEE_PER_LOT_ROUND_TURN_USD)
+        self.assertAlmostEqual(
+            result.net_pnl_usd,
+            DOLLARS_PER_TICK - FEE_PER_LOT_ROUND_TURN_USD,
+        )
+
+    def test_three_ticks_five_lots(self) -> None:
+        result = net_pnl_from_tick_move(3.0, 5)
+        self.assertAlmostEqual(result.gross_pnl_usd, 3.0 * DOLLARS_PER_TICK * 5)
+        self.assertAlmostEqual(result.fees_usd, 5.0 * FEE_PER_LOT_ROUND_TURN_USD)
+        self.assertAlmostEqual(result.net_pnl_usd, result.gross_pnl_usd - result.fees_usd)
+
+    def test_single_side_fee(self) -> None:
+        result = net_pnl_from_tick_move(2.0, 2, sides=1)
+        self.assertAlmostEqual(result.fees_usd, 2 * FEE_PER_LOT_PER_SIDE_USD)
+
+    def test_adverse_tick_move(self) -> None:
+        result = net_pnl_from_tick_move(-1.0, 1)
+        self.assertAlmostEqual(result.gross_pnl_usd, -DOLLARS_PER_TICK)
+        self.assertAlmostEqual(
+            result.net_pnl_usd,
+            -DOLLARS_PER_TICK - FEE_PER_LOT_ROUND_TURN_USD,
+        )
+
+    def test_lots_exceed_cap(self) -> None:
+        with self.assertRaises(ValueError):
+            net_pnl_from_tick_move(1.0, MAX_POSITION_LOTS + 1)
+
+    def test_projected_position_exceeds_cap(self) -> None:
+        with self.assertRaises(ValueError):
+            net_pnl_from_tick_move(
+                1.0,
+                2,
+                position_before=9,
+                signed_lot_delta=2,
+            )
+
+    def test_validate_trade_lots_zero_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            validate_trade_lots(0)
 
 
 class TestFeeAccounting(unittest.TestCase):

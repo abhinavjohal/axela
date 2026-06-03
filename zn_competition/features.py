@@ -1,6 +1,8 @@
 """
 Streaming microstructure feature engine for TT quote streams.
-Computes session VWAP, vwap_z, book imbalance, and realized vol in ticks.
+
+Pipeline outputs per tick: session VWAP, vwap_z, OBI (L1+L2), spread/vol in ZN ticks.
+Maintains a rolling OBI history array aligned with processed quotes.
 """
 
 from __future__ import annotations
@@ -10,28 +12,55 @@ from datetime import datetime
 
 from zn_competition.microstructure import (
     FeatureSnapshot,
+    OrderBookImbalanceCalculator,
+    OrderBookImbalanceResult,
     Quote,
     RollingStdTicks,
-    calculate_order_book_imbalance,
     order_book_from_quote,
 )
-from zn_competition.specs import CT, TICK_SIZE_FLOAT, in_liquidity_window
+from zn_competition.specs import CT, ZN_SEP26, in_liquidity_window
+
+
+@dataclass
+class OBIHistoryBuffer:
+    """Fixed-length rolling store of standardized OBI values."""
+
+    max_length: int = 500
+
+    _values: list[float] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if self.max_length < 1:
+            raise ValueError(f"max_length must be >= 1, got {self.max_length}")
+
+    def append(self, obi: float) -> None:
+        self._values.append(float(obi))
+        if len(self._values) > self.max_length:
+            self._values.pop(0)
+
+    def reset(self) -> None:
+        self._values.clear()
+
+    @property
+    def values(self) -> tuple[float, ...]:
+        return tuple(self._values)
+
+    def __len__(self) -> int:
+        return len(self._values)
 
 
 @dataclass
 class SessionVWAP:
-    """Session-anchored VWAP; resets on explicit new_session()."""
+    """Session-anchored VWAP; resets on explicit ``new_session()``."""
 
     _pv: float = 0.0
     _vol: float = 0.0
-    _last_mid: float | None = None
 
     def update(self, quote: Quote) -> float:
         mid = quote.mid
         vol = float(quote.volume) if quote.volume > 0 else 1.0
         self._pv += mid * vol
         self._vol += vol
-        self._last_mid = mid
         if self._vol <= 0:
             raise RuntimeError("session VWAP volume must be positive")
         return self._pv / self._vol
@@ -45,23 +74,52 @@ class SessionVWAP:
     def reset(self) -> None:
         self._pv = 0.0
         self._vol = 0.0
-        self._last_mid = None
 
 
 @dataclass
 class MicrostructureFeatureEngine:
+    """
+    Main feature pipeline: quote → ``FeatureSnapshot`` + OBI history.
+
+    All price deltas converted to ticks via ``ZN_SEP26.price_delta_to_ticks``
+    (tick size = 1/64 = 0.015625).
+    """
+
     vol_window: int = 120
     z_std_floor_ticks: float = 0.5
+    obi_history_length: int = 500
+
     _session: SessionVWAP = field(default_factory=SessionVWAP)
     _vol_estimator: RollingStdTicks = field(init=False)
+    _obi_history: OBIHistoryBuffer = field(init=False)
     _prev_mid: float | None = None
+    _snapshots: list[FeatureSnapshot] = field(default_factory=list)
 
     def __post_init__(self) -> None:
-        self._vol_estimator = RollingStdTicks(self.vol_window)
+        self._vol_estimator = RollingStdTicks(
+            self.vol_window,
+            min_std_ticks=self.z_std_floor_ticks,
+        )
+        self._obi_history = OBIHistoryBuffer(max_length=self.obi_history_length)
+
+    @property
+    def obi_history(self) -> tuple[float, ...]:
+        """Rolling array of OBI ratios, one entry per processed quote."""
+        return self._obi_history.values
+
+    @property
+    def snapshots(self) -> tuple[FeatureSnapshot, ...]:
+        """All feature snapshots emitted by this engine instance."""
+        return tuple(self._snapshots)
 
     def new_session(self) -> None:
         self._session.reset()
+        self._obi_history.reset()
+        self._snapshots.clear()
         self._prev_mid = None
+
+    def compute_obi(self, quote: Quote) -> OrderBookImbalanceResult:
+        return OrderBookImbalanceCalculator.from_quote(quote)
 
     def _session_tag(self, timestamp: str) -> str:
         try:
@@ -76,25 +134,38 @@ class MicrostructureFeatureEngine:
         return "off_peak"
 
     def update(self, quote: Quote) -> FeatureSnapshot:
+        """Process one quote and append OBI to the history array."""
         mid = quote.mid
         vwap = self._session.update(quote)
         std_ticks = self._vol_estimator.update(mid, self._prev_mid)
         self._prev_mid = mid
 
-        deviation_ticks = (mid - vwap) / TICK_SIZE_FLOAT
+        deviation_ticks = ZN_SEP26.price_delta_to_ticks(mid - vwap)
         safe_std = max(std_ticks, self.z_std_floor_ticks)
         vwap_z = deviation_ticks / safe_std
 
-        imb = calculate_order_book_imbalance(order_book_from_quote(quote))
-        realized_vol = std_ticks
+        obi_result = self.compute_obi(quote)
+        self._obi_history.append(obi_result.obi)
 
-        return FeatureSnapshot(
+        spread_ticks = order_book_from_quote(quote).spread_ticks
+
+        snapshot = FeatureSnapshot(
             timestamp=quote.timestamp,
             mid=mid,
             vwap=vwap,
             vwap_z=vwap_z,
-            book_imbalance=imb,
-            realized_vol_ticks_1h=realized_vol,
-            spread_ticks=quote.spread_ticks,
+            obi=obi_result.obi,
+            bid_qty=obi_result.bid_qty,
+            ask_qty=obi_result.ask_qty,
+            realized_vol_ticks_1h=std_ticks,
+            spread_ticks=spread_ticks,
             session_tag=self._session_tag(quote.timestamp),
         )
+        self._snapshots.append(snapshot)
+        return snapshot
+
+    def process_quotes(self, quotes: list[Quote]) -> list[FeatureSnapshot]:
+        """Batch-process a quote stream; returns aligned feature snapshot array."""
+        if not quotes:
+            raise ValueError("quotes list is empty")
+        return [self.update(quote) for quote in quotes]

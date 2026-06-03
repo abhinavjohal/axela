@@ -21,13 +21,23 @@ WEEKLY_VOLUME_MIN: tuple[int, ...] = (200, 300, 400, 500)
 TOTAL_VOLUME_MIN = 2000
 MAX_POSITION_LOTS = 10
 
-# ZN Globex: half of 1/32 point = 1/64 point (0.015625 in price space)
+# ZN Globex: half of 1/32 point = 1/64 point
 TICK_SIZE = Fraction(1, 64)
-TICK_SIZE_FLOAT = float(TICK_SIZE)
+TICK_SIZE_FLOAT = float(TICK_SIZE)  # 0.015625
 
 # $1,000 per full point × 1/64 point per tick
 DOLLARS_PER_POINT = 1000.0
 DOLLARS_PER_TICK = DOLLARS_PER_POINT * TICK_SIZE_FLOAT  # 15.625
+
+
+def price_delta_to_ticks(price_delta: float) -> float:
+    """Convert a ZN price difference to ticks (uses tick size 0.015625)."""
+    return price_delta / TICK_SIZE_FLOAT
+
+
+def ticks_to_price_delta(ticks: float) -> float:
+    """Convert tick count to ZN price space."""
+    return ticks * TICK_SIZE_FLOAT
 
 FEE_PER_LOT_PER_SIDE_USD = 0.50
 FEE_PER_LOT_ROUND_TURN_USD = 1.00

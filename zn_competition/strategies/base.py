@@ -5,6 +5,7 @@ from enum import Enum
 from typing import Protocol
 
 from zn_competition.features import FeatureSnapshot
+from zn_competition.microstructure import OrderBookSnapshot
 from zn_competition.specs import FEE_PER_LOT_ROUND_TURN_USD, ZN_SEP26
 
 
@@ -50,6 +51,11 @@ class StrategyContext:
     leg_lots_traded_total: int
     weekly_min_remaining: int
     features: FeatureSnapshot | None = None
+    book: OrderBookSnapshot | None = None
+    bid_l1_size: int = 0
+    ask_l1_size: int = 0
+    bid_l2_size: int = 0
+    ask_l2_size: int = 0
     event_tag: str | None = None
     event_phase: str | None = None
     surprise_10y_equiv_bp: float | None = None

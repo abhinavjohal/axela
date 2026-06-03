@@ -13,7 +13,7 @@ from pathlib import Path
 from zn_competition.economics import FeeAccounting, analyze_week_plan
 from zn_competition.execution import execute_signal
 from zn_competition.features import MicrostructureFeatureEngine
-from zn_competition.microstructure import Quote
+from zn_competition.microstructure import Quote, order_book_from_quote
 from zn_competition.risk import PositionLedger, RiskState
 from zn_competition.specs import WEEKLY_VOLUME_MIN, weekly_volume_requirement
 from zn_competition.strategies.base import StrategyContext
@@ -24,6 +24,8 @@ OPTIONAL_COLUMNS = frozenset(
     {
         "bid_size",
         "ask_size",
+        "bid_l2_size",
+        "ask_l2_size",
         "last",
         "volume",
         "event_tag",
@@ -97,6 +99,8 @@ def load_quotes(path: Path) -> list[Quote]:
                         ask=_parse_float(row, "ask"),
                         bid_size=_parse_int(row, "bid_size", 10),
                         ask_size=_parse_int(row, "ask_size", 10),
+                        bid_l2_size=_parse_int(row, "bid_l2_size", 0),
+                        ask_l2_size=_parse_int(row, "ask_l2_size", 0),
                         last=float(last_raw) if last_raw else None,
                         volume=_parse_int(row, "volume", 1),
                     )
@@ -144,6 +148,7 @@ def run_backtest(
         if event_rows and idx < len(event_rows):
             tag, phase, surprise = _row_event_fields(event_rows[idx])
 
+        book = order_book_from_quote(quote)
         ctx = StrategyContext(
             mid_price=features.mid,
             bid=quote.bid,
@@ -154,6 +159,11 @@ def run_backtest(
             leg_lots_traded_total=ledger.leg_lots_traded,
             weekly_min_remaining=max(0, weekly_min - ledger.leg_lots_traded),
             features=features,
+            book=book,
+            bid_l1_size=quote.bid_size,
+            ask_l1_size=quote.ask_size,
+            bid_l2_size=quote.bid_l2_size,
+            ask_l2_size=quote.ask_l2_size,
             event_tag=tag,
             event_phase=phase,
             surprise_10y_equiv_bp=surprise,

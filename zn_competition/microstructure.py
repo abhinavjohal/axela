@@ -18,6 +18,8 @@ class Quote:
     ask: float
     bid_size: int = 0
     ask_size: int = 0
+    bid_l2_size: int = 0
+    ask_l2_size: int = 0
     last: float | None = None
     volume: int = 0
 
@@ -28,6 +30,8 @@ class Quote:
             raise ValueError(f"crossed market: bid={self.bid}, ask={self.ask}")
         if self.bid_size < 0 or self.ask_size < 0:
             raise ValueError("sizes must be non-negative")
+        if self.bid_l2_size < 0 or self.ask_l2_size < 0:
+            raise ValueError("L2 sizes must be non-negative")
 
     @property
     def mid(self) -> float:
@@ -44,6 +48,69 @@ class Quote:
 
 
 @dataclass(frozen=True)
+class OrderBookSnapshot:
+    """Level 1 + Level 2 quantities at inside market (TT depth)."""
+
+    timestamp: str
+    bid: float
+    ask: float
+    bid_l1_size: int
+    ask_l1_size: int
+    bid_l2_size: int
+    ask_l2_size: int
+
+    def __post_init__(self) -> None:
+        if self.bid <= 0 or self.ask <= 0:
+            raise ValueError(f"bid/ask must be positive: bid={self.bid}, ask={self.ask}")
+        if self.ask < self.bid:
+            raise ValueError(f"crossed market: bid={self.bid}, ask={self.ask}")
+        for name, size in (
+            ("bid_l1_size", self.bid_l1_size),
+            ("ask_l1_size", self.ask_l1_size),
+            ("bid_l2_size", self.bid_l2_size),
+            ("ask_l2_size", self.ask_l2_size),
+        ):
+            if size < 0:
+                raise ValueError(f"{name} must be non-negative, got {size}")
+
+    @property
+    def inside_bid(self) -> float:
+        return ZN_SEP26.round_price_to_tick(self.bid)
+
+    @property
+    def inside_ask(self) -> float:
+        return ZN_SEP26.round_price_to_tick(self.ask)
+
+
+def calculate_order_book_imbalance(book: OrderBookSnapshot) -> float:
+    """
+    Order Book Imbalance (OBI) using L1 + L2 bid/ask displayed quantity.
+
+    OBI = (Q_bid_L1 + Q_bid_L2 - Q_ask_L1 - Q_ask_L2) / (Q_bid_L1 + Q_bid_L2 + Q_ask_L1 + Q_ask_L2)
+
+    Returns a value in [-1, 1]. Positive = bid-heavy (buy pressure).
+    """
+    bid_qty = book.bid_l1_size + book.bid_l2_size
+    ask_qty = book.ask_l1_size + book.ask_l2_size
+    total = bid_qty + ask_qty
+    if total <= 0:
+        return 0.0
+    return (bid_qty - ask_qty) / total
+
+
+def order_book_from_quote(quote: Quote) -> OrderBookSnapshot:
+    return OrderBookSnapshot(
+        timestamp=quote.timestamp,
+        bid=quote.bid,
+        ask=quote.ask,
+        bid_l1_size=quote.bid_size,
+        ask_l1_size=quote.ask_size,
+        bid_l2_size=quote.bid_l2_size,
+        ask_l2_size=quote.ask_l2_size,
+    )
+
+
+@dataclass(frozen=True)
 class FeatureSnapshot:
     timestamp: str
     mid: float
@@ -56,7 +123,7 @@ class FeatureSnapshot:
 
 
 def book_imbalance(bid_size: int, ask_size: int) -> float:
-    """Order-book imbalance in [-1, 1]. Positive = bid pressure."""
+    """L1-only imbalance in [-1, 1]. Prefer calculate_order_book_imbalance for L1+L2."""
     total = bid_size + ask_size
     if total <= 0:
         return 0.0

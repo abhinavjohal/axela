@@ -8,7 +8,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from zn_competition.microstructure import FeatureSnapshot, Quote, RollingStdTicks, book_imbalance
+from zn_competition.microstructure import (
+    FeatureSnapshot,
+    Quote,
+    RollingStdTicks,
+    calculate_order_book_imbalance,
+    order_book_from_quote,
+)
 from zn_competition.specs import CT, TICK_SIZE_FLOAT, in_liquidity_window
 
 
@@ -79,7 +85,7 @@ class MicrostructureFeatureEngine:
         safe_std = max(std_ticks, self.z_std_floor_ticks)
         vwap_z = deviation_ticks / safe_std
 
-        imb = book_imbalance(quote.bid_size, quote.ask_size)
+        imb = calculate_order_book_imbalance(order_book_from_quote(quote))
         realized_vol = std_ticks
 
         return FeatureSnapshot(

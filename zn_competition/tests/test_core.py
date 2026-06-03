@@ -15,7 +15,7 @@ from zn_competition.specs import MAX_POSITION_LOTS
 from zn_competition.execution import execute_signal
 from zn_competition.microstructure import Quote
 from zn_competition.risk import (
-    ExecutionException,
+    ExecutionRiskException,
     FillRecord,
     OrderRequest,
     PositionLedger,
@@ -133,7 +133,7 @@ class TestPositionLedger(unittest.TestCase):
 class TestExecution(unittest.TestCase):
     def test_max_position_validation(self) -> None:
         validate_order(8, OrderRequest(Side.BUY, 2, "ok"))
-        with self.assertRaises(ExecutionException):
+        with self.assertRaises(ExecutionRiskException):
             validate_order(9, OrderRequest(Side.BUY, 2, "breach"))
 
     def test_execute_signal(self) -> None:

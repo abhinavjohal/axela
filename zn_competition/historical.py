@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from zn_competition.execution import execute_signal
+from zn_competition.execution import ExecutionEngine, ExecutionRiskException
 from zn_competition.features import MicrostructureFeatureEngine
 from zn_competition.microstructure import Quote, order_book_from_quote
 from zn_competition.risk import ExecutionException, PositionLedger, RiskState
@@ -158,11 +158,13 @@ class HistoricalSimulator:
         self.risk = RiskState(daily_loss_limit_usd=daily_loss_limit_usd)
         self.feature_engine = MicrostructureFeatureEngine()
         self.session_mr = SessionMeanReversionStrategy(enable_volume_churn=True)
+        self.execution = ExecutionEngine()
         self.stack = StrategyStack(
-            [
+            strategies=[
                 MacroEventStrategy(),
                 self.session_mr,
-            ]
+            ],
+            execution=self.execution,
         )
         self.obi = OrderBookImbalanceHFT()
         self.signals_by_reason: dict[str, int] = {}
@@ -171,12 +173,21 @@ class HistoricalSimulator:
     def _record_action(self, engine: str) -> None:
         self.actions_by_engine[engine] = self.actions_by_engine.get(engine, 0) + 1
 
-    def _execute_stack_signal(self, signal, quote: Quote) -> None:
-        fill = execute_signal(signal, quote, self.ledger.position)
-        if fill is None:
+    def _process_stack_tick(self, ctx, quote: Quote) -> None:
+        pnl_before = self.ledger.realized_pnl_usd
+        result = self.stack.process_tick(ctx, quote, self.ledger)
+        if result.purge_report and result.purge_report.canceled_count > 0:
+            self.actions_by_engine["regime_purge"] = (
+                self.actions_by_engine.get("regime_purge", 0)
+                + result.purge_report.canceled_count
+            )
+        if result.signal is None:
             return
-        net = self.ledger.apply_fill(fill)
-        self.risk.apply_realized(net)
+        self.signals_by_reason[result.signal.reason] = (
+            self.signals_by_reason.get(result.signal.reason, 0) + 1
+        )
+        self.risk.apply_realized(self.ledger.realized_pnl_usd - pnl_before)
+        self._record_action("strategy_stack")
 
     def on_book_update(self, quote: Quote) -> None:
         if self.risk.halted:
@@ -187,13 +198,12 @@ class HistoricalSimulator:
         book = order_book_from_quote(quote)
         ctx = _build_context(quote, features, self.ledger, self.week, self.weekly_min)
 
-        signal = self.stack.on_tick(ctx)
-        if signal is not None:
-            self.signals_by_reason[signal.reason] = (
-                self.signals_by_reason.get(signal.reason, 0) + 1
+        try:
+            self._process_stack_tick(ctx, quote)
+        except ExecutionRiskException:
+            self.actions_by_engine["execution_blocked"] = (
+                self.actions_by_engine.get("execution_blocked", 0) + 1
             )
-            self._execute_stack_signal(signal, quote)
-            self._record_action("strategy_stack")
 
         _assert_ledger_position_cap(self.ledger)
         ctx = _build_context(quote, features, self.ledger, self.week, self.weekly_min)

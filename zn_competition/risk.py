@@ -4,14 +4,21 @@ Position ledger, fee accounting ($0.50/side), and loss limits (max 10 lots).
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 
 from zn_competition.specs import FEE_PER_LOT_PER_SIDE_USD, MAX_POSITION_LOTS, ZN_SEP26
 from zn_competition.strategies.base import Side
 
+logger = logging.getLogger(__name__)
+
 
 class ExecutionException(Exception):
-    """Raised when an order would violate competition execution rules (e.g. position cap)."""
+    """Raised when an order would violate competition execution rules."""
+
+
+class ExecutionRiskException(ExecutionException):
+    """Order blocked by competition risk gate (position cap, halted, etc.)."""
 
 
 @dataclass(frozen=True)
@@ -38,12 +45,90 @@ class RiskState:
             )
 
 
+def get_current_position(ledger: PositionLedger) -> int:
+    """Read signed net position from the ledger (source of truth for execution)."""
+    return ledger.position
+
+
+def assert_ledger_position_valid(ledger: PositionLedger) -> None:
+    """Ensure ledger position is within competition cap before any submission."""
+    position = get_current_position(ledger)
+    if abs(position) > MAX_POSITION_LOTS:
+        msg = (
+            f"POSITION_CAP: ledger position {position} exceeds maximum "
+            f"{MAX_POSITION_LOTS} lots"
+        )
+        logger.error("EXECUTION_RISK: %s", msg)
+        raise ExecutionRiskException(msg)
+
+
+def signed_incoming_lots(side: Side, lots: int, current_position: int) -> int:
+    """
+    Signed lot change applied by an order (for position + delta gate).
+
+    BUY: +lots, SELL: -lots, FLAT: delta that zeros position.
+    """
+    if lots < 0:
+        raise ValueError(f"lots must be non-negative, got {lots}")
+    if side == Side.BUY:
+        return lots
+    if side == Side.SELL:
+        return -lots
+    if side == Side.FLAT:
+        if current_position == 0:
+            return 0
+        if lots != abs(current_position):
+            raise ValueError(
+                f"FLAT lots {lots} must equal |position| {abs(current_position)}"
+            )
+        return -current_position
+    raise ValueError(f"unknown side {side}")
+
+
+def gate_order_submission(
+    current_position: int,
+    incoming_order_lots: int,
+    side: Side,
+) -> None:
+    """
+    Strict competition gate before the execution engine accepts an order.
+
+    Blocks when ``ABS(current_position + signed_incoming_lots) > MAX_POSITION_LOTS``.
+
+    ``incoming_order_lots`` is the unsigned order quantity; sign comes from ``side``.
+    """
+    if incoming_order_lots <= 0 and side != Side.FLAT:
+        msg = f"ORDER_REJECTED: lot size must be positive, got {incoming_order_lots}"
+        logger.error("EXECUTION_RISK: %s", msg)
+        raise ExecutionRiskException(msg)
+
+    if abs(current_position) > MAX_POSITION_LOTS:
+        msg = (
+            f"POSITION_CAP: current position {current_position} exceeds "
+            f"maximum {MAX_POSITION_LOTS} lots"
+        )
+        logger.error("EXECUTION_RISK: %s", msg)
+        raise ExecutionRiskException(msg)
+
+    signed_delta = signed_incoming_lots(side, incoming_order_lots, current_position)
+    projected_sum = current_position + signed_delta
+
+    if abs(projected_sum) > MAX_POSITION_LOTS:
+        msg = (
+            f"POSITION_CAP: ABS({current_position} + {signed_delta}) = "
+            f"{abs(projected_sum)} > {MAX_POSITION_LOTS} "
+            f"(side={side.value}, incoming_lots={incoming_order_lots})"
+        )
+        logger.error("EXECUTION_RISK: %s", msg)
+        raise ExecutionRiskException(msg)
+
+
 def clip_order_size(requested: int, position: int) -> int:
-    """Size orders internally; use ``enforce_order_size`` at execution to reject breaches."""
+    """Size orders internally; execution path uses ``enforce_order_size`` / gate."""
     if requested < 0:
         raise ValueError(f"requested lots must be non-negative, got {requested}")
     if abs(position) > MAX_POSITION_LOTS:
-        raise ExecutionException(
+        raise ExecutionRiskException(
             f"POSITION_CAP: current position {position} already exceeds "
             f"maximum {MAX_POSITION_LOTS} lots"
         )
@@ -51,42 +136,16 @@ def clip_order_size(requested: int, position: int) -> int:
     return max(0, min(requested, room))
 
 
-def enforce_order_size(requested: int, position: int) -> int:
-    """
-    Require the full requested size or raise ``ExecutionException``.
-
-    Silent clipping is not allowed on the execution path.
-    """
-    if requested <= 0:
-        raise ExecutionException(
-            f"ORDER_REJECTED: lot size must be positive, got {requested}"
-        )
-    if abs(position) > MAX_POSITION_LOTS:
-        raise ExecutionException(
-            f"POSITION_CAP: current position {position} exceeds "
-            f"maximum {MAX_POSITION_LOTS} lots"
-        )
-    room = MAX_POSITION_LOTS - abs(position)
-    if requested > room:
-        raise ExecutionException(
-            f"POSITION_CAP: order size {requested} would breach the {MAX_POSITION_LOTS}-lot "
-            f"cap (position={position}, available_room={room})"
-        )
+def enforce_order_size(requested: int, position: int, side: Side) -> int:
+    """Require full size or raise ``ExecutionRiskException`` (no silent clip)."""
+    gate_order_submission(position, requested, side)
     return requested
 
 
 def projected_position(current: int, side: Side, lots: int) -> int:
     if lots < 0:
         raise ValueError(f"lots must be non-negative, got {lots}")
-    if side == Side.BUY:
-        return current + lots
-    if side == Side.SELL:
-        return current - lots
-    if side == Side.FLAT:
-        if lots != abs(current):
-            raise ValueError(f"FLAT lots {lots} must equal |position| {abs(current)}")
-        return 0
-    raise ValueError(f"unknown side {side}")
+    return current + signed_incoming_lots(side, lots, current)
 
 
 def validate_order(current_position: int, order: OrderRequest) -> None:
@@ -96,13 +155,7 @@ def validate_order(current_position: int, order: OrderRequest) -> None:
         raise ValueError(
             f"FLAT order lots {order.lots} must equal |position| {abs(current_position)}"
         )
-    if order.side != Side.FLAT:
-        new_pos = projected_position(current_position, order.side, order.lots)
-        if abs(new_pos) > MAX_POSITION_LOTS:
-            raise ExecutionException(
-                f"POSITION_CAP: order would move position {current_position} -> {new_pos} "
-                f"(maximum absolute size {MAX_POSITION_LOTS})"
-            )
+    gate_order_submission(current_position, order.lots, order.side)
 
 
 @dataclass(frozen=True)

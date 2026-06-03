@@ -1,16 +1,16 @@
 """
-Session mean-reversion on ZN — works when vol is moderate and no macro shock.
-Best in US morning chop and post-auction digestion, not into FOMC.
+Session VWAP mean reversion — fee-aware entries on ZN tick grid.
+Blocked during high-impact macro; requires positive net edge vs $1.00 RT.
 """
 
 from __future__ import annotations
 
+from zn_competition.specs import HIGH_IMPACT_MACRO_TAGS, ZN_SEP26
 from zn_competition.strategies.base import Side, Signal, StrategyContext
 
-# Block list: do not fade during these
-BLOCKED_EVENTS = frozenset(
-    {"FOMC_rate_decision", "NFP", "CPI", "10Y_auction", "30Y_auction"}
-)
+MIN_NET_EDGE_TICKS_RT = ZN_SEP26.dollars_to_ticks(
+    ZN_SEP26.fee_round_turn, lots=1
+) + 0.25
 
 
 class SessionMeanReversionStrategy:
@@ -18,45 +18,62 @@ class SessionMeanReversionStrategy:
 
     def __init__(
         self,
-        z_window_ticks: float = 2.0,
         entry_z: float = 1.25,
         exit_z: float = 0.35,
         size: int = 2,
         max_hold_seconds: int = 900,
-    ):
-        self.z_window_ticks = z_window_ticks
+        min_session_tag: str = "high_liquidity",
+    ) -> None:
+        if entry_z <= exit_z:
+            raise ValueError("entry_z must exceed exit_z")
+        if size < 1 or size > ZN_SEP26.max_position_lots:
+            raise ValueError(f"size must be 1–{ZN_SEP26.max_position_lots}")
         self.entry_z = entry_z
         self.exit_z = exit_z
         self.size = size
         self.max_hold_seconds = max_hold_seconds
+        self.min_session_tag = min_session_tag
 
     def on_tick(self, ctx: StrategyContext) -> Signal | None:
-        if ctx.event_tag in BLOCKED_EVENTS:
+        if ctx.event_tag in HIGH_IMPACT_MACRO_TAGS:
+            return None
+        if ctx.features is None:
+            return None
+        if ctx.features.session_tag != self.min_session_tag:
+            return None
+        if ctx.features.spread_ticks > 2.0:
             return None
 
-        # Requires upstream feature: deviation from session VWAP in ticks
-        z = ctx.extra.get("vwap_z")
-        if z is None:
-            return None
+        z = ctx.features.vwap_z
+        abs_z = abs(z)
 
-        if abs(z) < self.entry_z:
-            if ctx.position != 0 and abs(z) < self.exit_z:
-                return Signal(
-                    side=Side.FLAT,
-                    size=abs(ctx.position),
-                    urgency="aggressive",
-                    reason="mr_exit_vwap",
-                    expected_edge_ticks=0.5,
-                    max_hold_seconds=self.max_hold_seconds,
-                )
+        if ctx.position != 0 and abs_z < self.exit_z:
+            return Signal(
+                side=Side.FLAT,
+                size=abs(ctx.position),
+                urgency="aggressive",
+                reason="mr_exit_vwap",
+                expected_edge_ticks=0.5,
+                max_hold_seconds=self.max_hold_seconds,
+            )
+
+        if abs_z < self.entry_z:
             return None
 
         side = Side.SELL if z > 0 else Side.BUY
-        return Signal(
+        lots = min(self.size, ZN_SEP26.max_position_lots - abs(ctx.position))
+        if lots <= 0:
+            return None
+
+        expected_ticks = min(abs_z * 0.4, 2.5)
+        signal = Signal(
             side=side,
-            size=min(self.size, 10 - abs(ctx.position)),
+            size=lots,
             urgency="passive",
             reason="mr_enter_vwap",
-            expected_edge_ticks=0.75,
+            expected_edge_ticks=expected_ticks,
             max_hold_seconds=self.max_hold_seconds,
         )
+        if signal.net_edge_after_round_turn_fee_ticks(lots) < MIN_NET_EDGE_TICKS_RT:
+            return None
+        return signal

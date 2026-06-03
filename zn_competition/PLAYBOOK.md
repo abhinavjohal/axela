@@ -55,7 +55,7 @@ ZN is a **rates beta** instrument: your alpha is timing **yield shocks** and **m
 - 2000 lots full comp ≈ **$1,000** fees if all counted on ZN.
 - Breakeven ≈ **0.032 ticks per lot** on average — trivial if you trade rarely with edge; deadly if you churn.
 
-**1 tick = $15.625** per lot. One good macro trade (+3 ticks) on 3 lots ≈ $140 gross — covers 280 lots of fees in theory.
+**1 tick = $15.625** per lot. **Round-turn fee = $1.00/lot** (0.064 ticks). One good macro trade (+3 ticks) on 3 lots ≈ $140 gross — covers 140 round-turns in theory.
 
 ---
 

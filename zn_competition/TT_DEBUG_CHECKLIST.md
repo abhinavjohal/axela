@@ -18,7 +18,7 @@ Use this before Week 1 (200 lots). One wrong setting destroys edge faster than a
 ## 3. Order types & fees
 
 - [ ] Limit vs market: default **limit** for MR/MM sleeves; market only macro post-release.
-- [ ] Fee model in sim: **$0.50 per lot per leg** — verify if round-turn counts as 1 or 2 lots with organizer.
+- [ ] Fee model in sim: **$0.50 per lot per side** ($1.00 round-turn) — code uses per-leg counting; confirm organizer matches.
 - [ ] Volume counter: confirm whether **partial fills** sum to lots the same way as full fills.
 
 ## 4. Risk on TT

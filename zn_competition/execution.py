@@ -5,7 +5,13 @@ Simulated execution on ZN tick grid with per-side fees.
 from __future__ import annotations
 
 from zn_competition.microstructure import Quote, aggressive_fill_price, passive_fill_price
-from zn_competition.risk import FillRecord, OrderRequest, clip_order_size, validate_order
+from zn_competition.risk import (
+    ExecutionException,
+    FillRecord,
+    OrderRequest,
+    enforce_order_size,
+    validate_order,
+)
 from zn_competition.specs import FEE_PER_LOT_PER_SIDE_USD, ZN_SEP26
 from zn_competition.strategies.base import Side, Signal
 
@@ -15,9 +21,7 @@ def signal_to_order(signal: Signal, position: int) -> OrderRequest | None:
         if position == 0:
             return None
         return OrderRequest(side=Side.FLAT, lots=abs(position), reason=signal.reason)
-    lots = clip_order_size(signal.size, position)
-    if lots <= 0:
-        return None
+    lots = enforce_order_size(signal.size, position)
     return OrderRequest(side=signal.side, lots=lots, reason=signal.reason)
 
 

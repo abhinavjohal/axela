@@ -10,6 +10,10 @@ from zn_competition.specs import FEE_PER_LOT_PER_SIDE_USD, MAX_POSITION_LOTS, ZN
 from zn_competition.strategies.base import Side
 
 
+class ExecutionException(Exception):
+    """Raised when an order would violate competition execution rules (e.g. position cap)."""
+
+
 @dataclass(frozen=True)
 class OrderRequest:
     side: Side
@@ -35,12 +39,40 @@ class RiskState:
 
 
 def clip_order_size(requested: int, position: int) -> int:
+    """Size orders internally; use ``enforce_order_size`` at execution to reject breaches."""
     if requested < 0:
         raise ValueError(f"requested lots must be non-negative, got {requested}")
     if abs(position) > MAX_POSITION_LOTS:
-        raise ValueError(f"position {position} exceeds cap {MAX_POSITION_LOTS}")
+        raise ExecutionException(
+            f"POSITION_CAP: current position {position} already exceeds "
+            f"maximum {MAX_POSITION_LOTS} lots"
+        )
     room = MAX_POSITION_LOTS - abs(position)
     return max(0, min(requested, room))
+
+
+def enforce_order_size(requested: int, position: int) -> int:
+    """
+    Require the full requested size or raise ``ExecutionException``.
+
+    Silent clipping is not allowed on the execution path.
+    """
+    if requested <= 0:
+        raise ExecutionException(
+            f"ORDER_REJECTED: lot size must be positive, got {requested}"
+        )
+    if abs(position) > MAX_POSITION_LOTS:
+        raise ExecutionException(
+            f"POSITION_CAP: current position {position} exceeds "
+            f"maximum {MAX_POSITION_LOTS} lots"
+        )
+    room = MAX_POSITION_LOTS - abs(position)
+    if requested > room:
+        raise ExecutionException(
+            f"POSITION_CAP: order size {requested} would breach the {MAX_POSITION_LOTS}-lot "
+            f"cap (position={position}, available_room={room})"
+        )
+    return requested
 
 
 def projected_position(current: int, side: Side, lots: int) -> int:
@@ -67,8 +99,9 @@ def validate_order(current_position: int, order: OrderRequest) -> None:
     if order.side != Side.FLAT:
         new_pos = projected_position(current_position, order.side, order.lots)
         if abs(new_pos) > MAX_POSITION_LOTS:
-            raise ValueError(
-                f"order breaches cap: {current_position} -> {new_pos} (max {MAX_POSITION_LOTS})"
+            raise ExecutionException(
+                f"POSITION_CAP: order would move position {current_position} -> {new_pos} "
+                f"(maximum absolute size {MAX_POSITION_LOTS})"
             )
 
 

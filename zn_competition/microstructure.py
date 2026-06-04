@@ -1,5 +1,5 @@
 """
-ZN market microstructure utilities — tick grid, spread, order book imbalance.
+ZN market microstructure utilities — tick grid, spread, Level 1 direct OBI.
 Standard library only. All tick math uses ``specs.TICK_SIZE_FLOAT`` (0.015625).
 """
 
@@ -10,16 +10,21 @@ from math import sqrt
 
 from zn_competition.specs import TICK_SIZE_FLOAT, ZN_SEP26
 
+# TT ADL Level 1 field names (inside market direct quantities + order counts).
+LEVEL1_QTY_FIELDS = frozenset({"direct_bid_qty", "direct_ask_qty"})
+LEVEL1_COUNT_FIELDS = frozenset({"bid_order_count", "ask_order_count"})
+LEVEL1_LEGACY_QTY_ALIASES = frozenset({"bid_size", "ask_size"})
+
 
 @dataclass(frozen=True)
 class Quote:
     timestamp: str
     bid: float
     ask: float
-    bid_size: int = 0
-    ask_size: int = 0
-    bid_l2_size: int = 0
-    ask_l2_size: int = 0
+    direct_bid_qty: int = 0
+    direct_ask_qty: int = 0
+    bid_order_count: int = 1
+    ask_order_count: int = 1
     last: float | None = None
     volume: int = 0
 
@@ -28,10 +33,10 @@ class Quote:
             raise ValueError(f"bid/ask must be positive: bid={self.bid}, ask={self.ask}")
         if self.ask < self.bid:
             raise ValueError(f"crossed market: bid={self.bid}, ask={self.ask}")
-        if self.bid_size < 0 or self.ask_size < 0:
-            raise ValueError("L1 sizes must be non-negative")
-        if self.bid_l2_size < 0 or self.ask_l2_size < 0:
-            raise ValueError("L2 sizes must be non-negative")
+        if self.direct_bid_qty < 0 or self.direct_ask_qty < 0:
+            raise ValueError("direct_bid_qty and direct_ask_qty must be non-negative")
+        if self.bid_order_count < 0 or self.ask_order_count < 0:
+            raise ValueError("bid_order_count and ask_order_count must be non-negative")
 
     @property
     def mid(self) -> float:
@@ -49,39 +54,29 @@ class Quote:
 
 @dataclass(frozen=True)
 class OrderBookSnapshot:
-    """Level 1 + Level 2 displayed quantities at the inside market."""
+    """Level 1 inside-market snapshot (TT ADL direct qty + order counts)."""
 
     timestamp: str
     bid: float
     ask: float
-    bid_l1_size: int
-    ask_l1_size: int
-    bid_l2_size: int
-    ask_l2_size: int
+    direct_bid_qty: int
+    direct_ask_qty: int
+    bid_order_count: int
+    ask_order_count: int
 
     def __post_init__(self) -> None:
         if self.bid <= 0 or self.ask <= 0:
             raise ValueError(f"bid/ask must be positive: bid={self.bid}, ask={self.ask}")
         if self.ask < self.bid:
             raise ValueError(f"crossed market: bid={self.bid}, ask={self.ask}")
-        for name, size in (
-            ("bid_l1_size", self.bid_l1_size),
-            ("ask_l1_size", self.ask_l1_size),
-            ("bid_l2_size", self.bid_l2_size),
-            ("ask_l2_size", self.ask_l2_size),
+        for name, val in (
+            ("direct_bid_qty", self.direct_bid_qty),
+            ("direct_ask_qty", self.direct_ask_qty),
+            ("bid_order_count", self.bid_order_count),
+            ("ask_order_count", self.ask_order_count),
         ):
-            if size < 0:
-                raise ValueError(f"{name} must be non-negative, got {size}")
-
-    @property
-    def bid_qty(self) -> int:
-        """Aggregate bid displayed size: Level 1 + Level 2."""
-        return self.bid_l1_size + self.bid_l2_size
-
-    @property
-    def ask_qty(self) -> int:
-        """Aggregate ask displayed size: Level 1 + Level 2."""
-        return self.ask_l1_size + self.ask_l2_size
+            if val < 0:
+                raise ValueError(f"{name} must be non-negative, got {val}")
 
     @property
     def inside_bid(self) -> float:
@@ -96,91 +91,160 @@ class OrderBookSnapshot:
         return ZN_SEP26.price_delta_to_ticks(self.ask - self.bid)
 
 
-@dataclass(frozen=True)
-class OrderBookImbalanceResult:
-    """Standardized OBI output from L1+L2 depth."""
+def _avg_order_size(qty: int, order_count: int) -> float:
+    if order_count <= 0:
+        return 0.0
+    return qty / order_count
 
-    obi: float
-    bid_qty: int
-    ask_qty: int
-    bid_l1_size: int
-    ask_l1_size: int
-    bid_l2_size: int
-    ask_l2_size: int
+
+def calculate_direct_obi(direct_bid_qty: int, direct_ask_qty: int) -> float:
+    """
+    TT ADL / Python direct OBI::
+
+        direct_obi = (direct_bid_qty - direct_ask_qty)
+                     / (direct_bid_qty + direct_ask_qty)
+
+    Returns 0.0 when total displayed quantity is zero.
+    """
+    if direct_bid_qty < 0 or direct_ask_qty < 0:
+        raise ValueError("quantities must be non-negative")
+    total = direct_bid_qty + direct_ask_qty
+    if total <= 0:
+        return 0.0
+    return (direct_bid_qty - direct_ask_qty) / total
+
+
+@dataclass(frozen=True)
+class DirectOBIResult:
+    """Level 1 OBI and average order sizes from TT direct fields."""
+
+    direct_obi: float
+    direct_bid_qty: int
+    direct_ask_qty: int
+    bid_order_count: int
+    ask_order_count: int
+    avg_bid_order_size: float
+    avg_ask_order_size: float
 
     @property
-    def total_qty(self) -> int:
-        return self.bid_qty + self.ask_qty
+    def obi(self) -> float:
+        """Backward-compatible alias for ``direct_obi``."""
+        return self.direct_obi
+
+
+def parse_level1_book_fields(
+    direct_bid_qty: int,
+    direct_ask_qty: int,
+    bid_order_count: int,
+    ask_order_count: int,
+) -> DirectOBIResult:
+    """
+    Validate TT Level 1 inputs and compute ``direct_obi`` plus average order sizes.
+
+    ``avg_bid_order_size = direct_bid_qty / bid_order_count`` (0 when count is 0).
+    ``avg_ask_order_size = direct_ask_qty / ask_order_count`` (0 when count is 0).
+    """
+    for name, val in (
+        ("direct_bid_qty", direct_bid_qty),
+        ("direct_ask_qty", direct_ask_qty),
+        ("bid_order_count", bid_order_count),
+        ("ask_order_count", ask_order_count),
+    ):
+        if val < 0:
+            raise ValueError(f"{name} must be non-negative, got {val}")
+
+    return DirectOBIResult(
+        direct_obi=calculate_direct_obi(direct_bid_qty, direct_ask_qty),
+        direct_bid_qty=direct_bid_qty,
+        direct_ask_qty=direct_ask_qty,
+        bid_order_count=bid_order_count,
+        ask_order_count=ask_order_count,
+        avg_bid_order_size=_avg_order_size(direct_bid_qty, bid_order_count),
+        avg_ask_order_size=_avg_order_size(direct_ask_qty, ask_order_count),
+    )
+
+
+def parse_level1_from_mapping(
+    row: dict[str, str],
+    *,
+    default_direct_bid_qty: int = 0,
+    default_direct_ask_qty: int = 0,
+) -> DirectOBIResult:
+    """
+    Parse Level 1 quantities from a CSV/TT row dict.
+
+    Accepts canonical names ``direct_bid_qty`` / ``direct_ask_qty`` or legacy
+    ``bid_size`` / ``ask_size``. Does not read or aggregate multi-level depth.
+    """
+
+    def _int(key: str, default: int = 0) -> int:
+        raw = row.get(key, "").strip()
+        if not raw:
+            return default
+        return int(float(raw))
+
+    bid_raw = row.get("direct_bid_qty", "").strip() or row.get("bid_size", "").strip()
+    ask_raw = row.get("direct_ask_qty", "").strip() or row.get("ask_size", "").strip()
+    direct_bid_qty = int(float(bid_raw)) if bid_raw else default_direct_bid_qty
+    direct_ask_qty = int(float(ask_raw)) if ask_raw else default_direct_ask_qty
+
+    bid_order_count = _int("bid_order_count", default=1 if direct_bid_qty > 0 else 0)
+    ask_order_count = _int("ask_order_count", default=1 if direct_ask_qty > 0 else 0)
+
+    return parse_level1_book_fields(
+        direct_bid_qty,
+        direct_ask_qty,
+        bid_order_count,
+        ask_order_count,
+    )
 
 
 class OrderBookImbalanceCalculator:
     """
-    Computes the standardized Order Book Imbalance ratio from L1 and L2 quantities.
+    Level 1 direct OBI calculator (TT ADL parity).
 
-    Formula (Bid_Qty and Ask_Qty are L1+L2 aggregates)::
+    Formula::
 
-        OBI = (Bid_Qty - Ask_Qty) / (Bid_Qty + Ask_Qty)
-
-    Range: [-1, 1]. Positive values indicate bid-side (buy) pressure.
-    Returns 0.0 when total displayed quantity is zero.
+        direct_obi = (direct_bid_qty - direct_ask_qty)
+                     / (direct_bid_qty + direct_ask_qty)
     """
 
     @staticmethod
     def from_quantities(
-        bid_l1_size: int,
-        ask_l1_size: int,
-        bid_l2_size: int = 0,
-        ask_l2_size: int = 0,
-    ) -> OrderBookImbalanceResult:
-        for name, val in (
-            ("bid_l1_size", bid_l1_size),
-            ("ask_l1_size", ask_l1_size),
-            ("bid_l2_size", bid_l2_size),
-            ("ask_l2_size", ask_l2_size),
-        ):
-            if val < 0:
-                raise ValueError(f"{name} must be non-negative, got {val}")
-
-        bid_qty = bid_l1_size + bid_l2_size
-        ask_qty = ask_l1_size + ask_l2_size
-        total = bid_qty + ask_qty
-        if total <= 0:
-            obi = 0.0
-        else:
-            obi = (bid_qty - ask_qty) / total
-
-        return OrderBookImbalanceResult(
-            obi=obi,
-            bid_qty=bid_qty,
-            ask_qty=ask_qty,
-            bid_l1_size=bid_l1_size,
-            ask_l1_size=ask_l1_size,
-            bid_l2_size=bid_l2_size,
-            ask_l2_size=ask_l2_size,
+        direct_bid_qty: int,
+        direct_ask_qty: int,
+        bid_order_count: int = 1,
+        ask_order_count: int = 1,
+    ) -> DirectOBIResult:
+        return parse_level1_book_fields(
+            direct_bid_qty,
+            direct_ask_qty,
+            bid_order_count,
+            ask_order_count,
         )
 
     @classmethod
-    def from_snapshot(cls, book: OrderBookSnapshot) -> OrderBookImbalanceResult:
+    def from_snapshot(cls, book: OrderBookSnapshot) -> DirectOBIResult:
         return cls.from_quantities(
-            book.bid_l1_size,
-            book.ask_l1_size,
-            book.bid_l2_size,
-            book.ask_l2_size,
+            book.direct_bid_qty,
+            book.direct_ask_qty,
+            book.bid_order_count,
+            book.ask_order_count,
         )
 
     @classmethod
-    def from_quote(cls, quote: Quote) -> OrderBookImbalanceResult:
+    def from_quote(cls, quote: Quote) -> DirectOBIResult:
         return cls.from_quantities(
-            quote.bid_size,
-            quote.ask_size,
-            quote.bid_l2_size,
-            quote.ask_l2_size,
+            quote.direct_bid_qty,
+            quote.direct_ask_qty,
+            quote.bid_order_count,
+            quote.ask_order_count,
         )
 
 
 def calculate_order_book_imbalance(book: OrderBookSnapshot) -> float:
-    """Return OBI ratio for an ``OrderBookSnapshot`` (L1+L2)."""
-    return OrderBookImbalanceCalculator.from_snapshot(book).obi
+    """Return ``direct_obi`` for an ``OrderBookSnapshot``."""
+    return OrderBookImbalanceCalculator.from_snapshot(book).direct_obi
 
 
 def order_book_from_quote(quote: Quote) -> OrderBookSnapshot:
@@ -188,10 +252,10 @@ def order_book_from_quote(quote: Quote) -> OrderBookSnapshot:
         timestamp=quote.timestamp,
         bid=quote.bid,
         ask=quote.ask,
-        bid_l1_size=quote.bid_size,
-        ask_l1_size=quote.ask_size,
-        bid_l2_size=quote.bid_l2_size,
-        ask_l2_size=quote.ask_l2_size,
+        direct_bid_qty=quote.direct_bid_qty,
+        direct_ask_qty=quote.direct_ask_qty,
+        bid_order_count=quote.bid_order_count,
+        ask_order_count=quote.ask_order_count,
     )
 
 
@@ -201,27 +265,26 @@ class FeatureSnapshot:
     mid: float
     vwap: float
     vwap_z: float
-    obi: float
-    bid_qty: int
-    ask_qty: int
+    direct_obi: float
+    avg_bid_order_size: float
+    avg_ask_order_size: float
+    direct_bid_qty: int
+    direct_ask_qty: int
+    bid_order_count: int
+    ask_order_count: int
     realized_vol_ticks_1h: float
     spread_ticks: float
     session_tag: str
 
     @property
+    def obi(self) -> float:
+        """Backward-compatible alias for ``direct_obi``."""
+        return self.direct_obi
+
+    @property
     def book_imbalance(self) -> float:
-        """Backward-compatible alias for ``obi``."""
-        return self.obi
-
-
-def book_imbalance_l1_only(bid_size: int, ask_size: int) -> float:
-    """L1-only OBI; prefer ``OrderBookImbalanceCalculator`` for production."""
-    if bid_size < 0 or ask_size < 0:
-        raise ValueError("sizes must be non-negative")
-    total = bid_size + ask_size
-    if total <= 0:
-        return 0.0
-    return (bid_size - ask_size) / total
+        """Backward-compatible alias for ``direct_obi``."""
+        return self.direct_obi
 
 
 def passive_fill_price(side: str, quote: Quote) -> float:

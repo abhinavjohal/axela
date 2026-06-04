@@ -1,5 +1,5 @@
 """
-High-frequency Order Book Imbalance (OBI) strategy — L1 + L2 depth.
+High-frequency Order Book Imbalance (OBI) strategy — Level 1 direct qty.
 
 TT checklist: passive limits at inside market; $0.50/side ($1.00 RT); max 10 lots.
 """
@@ -109,10 +109,10 @@ class OrderBookImbalanceHFT:
             timestamp="",
             bid=ctx.bid,
             ask=ctx.ask,
-            bid_l1_size=ctx.bid_l1_size,
-            ask_l1_size=ctx.ask_l1_size,
-            bid_l2_size=ctx.bid_l2_size,
-            ask_l2_size=ctx.ask_l2_size,
+            direct_bid_qty=ctx.direct_bid_qty,
+            direct_ask_qty=ctx.direct_ask_qty,
+            bid_order_count=ctx.bid_order_count,
+            ask_order_count=ctx.ask_order_count,
         )
 
     def on_tick(self, ctx: StrategyContext) -> Signal | None:
@@ -146,7 +146,7 @@ class OrderBookImbalanceHFT:
                 side=Side.BUY,
                 size=lots,
                 urgency="passive",
-                reason="obi_passive_bid_l2",
+                reason="obi_passive_bid",
                 expected_edge_ticks=self.entry_threshold,
                 max_hold_seconds=30,
             )
@@ -159,7 +159,7 @@ class OrderBookImbalanceHFT:
                 side=Side.SELL,
                 size=lots,
                 urgency="passive",
-                reason="obi_passive_ask_l2",
+                reason="obi_passive_ask",
                 expected_edge_ticks=abs(self.short_entry_threshold),
                 max_hold_seconds=30,
             )
@@ -269,14 +269,14 @@ class OrderBookImbalanceHFT:
         if lots <= 0:
             return None
         limit_price = book.inside_bid
-        order = OrderRequest(Side.BUY, lots, reason="obi_passive_bid_l2")
+        order = OrderRequest(Side.BUY, lots, reason="obi_passive_bid")
         validate_order(ledger.position, order)
         return WorkingLimitOrder(
             side=Side.BUY,
             lots=lots,
             limit_price=limit_price,
             placed_at=quote.timestamp,
-            reason="obi_passive_bid_l2",
+            reason="obi_passive_bid",
         )
 
     def _place_passive_ask(
@@ -290,14 +290,14 @@ class OrderBookImbalanceHFT:
         if lots <= 0:
             return None
         limit_price = book.inside_ask
-        order = OrderRequest(Side.SELL, lots, reason="obi_passive_ask_l2")
+        order = OrderRequest(Side.SELL, lots, reason="obi_passive_ask")
         validate_order(ledger.position, order)
         return WorkingLimitOrder(
             side=Side.SELL,
             lots=lots,
             limit_price=limit_price,
             placed_at=quote.timestamp,
-            reason="obi_passive_ask_l2",
+            reason="obi_passive_ask",
         )
 
     def _try_fill_working_order(

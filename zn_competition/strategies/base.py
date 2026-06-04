@@ -52,10 +52,10 @@ class StrategyContext:
     weekly_min_remaining: int
     features: FeatureSnapshot | None = None
     book: OrderBookSnapshot | None = None
-    bid_l1_size: int = 0
-    ask_l1_size: int = 0
-    bid_l2_size: int = 0
-    ask_l2_size: int = 0
+    direct_bid_qty: int = 0
+    direct_ask_qty: int = 0
+    bid_order_count: int = 1
+    ask_order_count: int = 1
     event_tag: str | None = None
     event_phase: str | None = None
     surprise_10y_equiv_bp: float | None = None

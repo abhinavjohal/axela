@@ -16,10 +16,10 @@ def _book() -> OrderBookSnapshot:
         timestamp="2026-06-03T14:00:00+00:00",
         bid=112.0,
         ask=112.03125,
-        bid_l1_size=20,
-        ask_l1_size=20,
-        bid_l2_size=10,
-        ask_l2_size=10,
+        direct_bid_qty=20,
+        direct_ask_qty=20,
+        bid_order_count=4,
+        ask_order_count=4,
     )
 
 
@@ -61,8 +61,8 @@ class TestVolumeChurnerExecution(unittest.TestCase):
             book.timestamp,
             book.bid,
             book.ask,
-            book.bid_l1_size,
-            book.ask_l1_size,
+            direct_bid_qty=book.direct_bid_qty,
+            direct_ask_qty=book.direct_ask_qty,
         )
         ctx = _ctx()
         result = churner.process_tick(quote, book, ledger, ctx)

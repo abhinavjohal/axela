@@ -1,8 +1,8 @@
 """
 Streaming microstructure feature engine for TT quote streams.
 
-Pipeline outputs per tick: session VWAP, vwap_z, OBI (L1+L2), spread/vol in ZN ticks.
-Maintains a rolling OBI history array aligned with processed quotes.
+Level 1 only: direct_bid_qty, direct_ask_qty, bid_order_count, ask_order_count.
+Price deltas scaled with ZN tick size 1/64 (0.015625) via ``ZN_SEP26``.
 """
 
 from __future__ import annotations
@@ -11,19 +11,26 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from zn_competition.microstructure import (
+    DirectOBIResult,
     FeatureSnapshot,
     OrderBookImbalanceCalculator,
-    OrderBookImbalanceResult,
     Quote,
     RollingStdTicks,
     order_book_from_quote,
 )
 from zn_competition.specs import CT, ZN_SEP26, in_liquidity_window
 
+FEATURE_TABLE_COLUMNS: tuple[str, ...] = (
+    "timestamp",
+    "direct_obi",
+    "avg_bid_order_size",
+    "avg_ask_order_size",
+)
+
 
 @dataclass
 class OBIHistoryBuffer:
-    """Fixed-length rolling store of standardized OBI values."""
+    """Fixed-length rolling store of direct OBI values."""
 
     max_length: int = 500
 
@@ -33,8 +40,8 @@ class OBIHistoryBuffer:
         if self.max_length < 1:
             raise ValueError(f"max_length must be >= 1, got {self.max_length}")
 
-    def append(self, obi: float) -> None:
-        self._values.append(float(obi))
+    def append(self, direct_obi: float) -> None:
+        self._values.append(float(direct_obi))
         if len(self._values) > self.max_length:
             self._values.pop(0)
 
@@ -79,10 +86,10 @@ class SessionVWAP:
 @dataclass
 class MicrostructureFeatureEngine:
     """
-    Main feature pipeline: quote → ``FeatureSnapshot`` + OBI history.
+    Main feature pipeline: quote → ``FeatureSnapshot`` + direct OBI history.
 
     All price deltas converted to ticks via ``ZN_SEP26.price_delta_to_ticks``
-    (tick size = 1/64 = 0.015625).
+    (minimum increment = 1/64 = 0.015625).
     """
 
     vol_window: int = 120
@@ -104,7 +111,7 @@ class MicrostructureFeatureEngine:
 
     @property
     def obi_history(self) -> tuple[float, ...]:
-        """Rolling array of OBI ratios, one entry per processed quote."""
+        """Rolling array of direct OBI ratios, one entry per processed quote."""
         return self._obi_history.values
 
     @property
@@ -118,7 +125,7 @@ class MicrostructureFeatureEngine:
         self._snapshots.clear()
         self._prev_mid = None
 
-    def compute_obi(self, quote: Quote) -> OrderBookImbalanceResult:
+    def compute_direct_obi(self, quote: Quote) -> DirectOBIResult:
         return OrderBookImbalanceCalculator.from_quote(quote)
 
     def _session_tag(self, timestamp: str) -> str:
@@ -134,7 +141,7 @@ class MicrostructureFeatureEngine:
         return "off_peak"
 
     def update(self, quote: Quote) -> FeatureSnapshot:
-        """Process one quote and append OBI to the history array."""
+        """Process one quote; append direct OBI to history."""
         mid = quote.mid
         vwap = self._session.update(quote)
         std_ticks = self._vol_estimator.update(mid, self._prev_mid)
@@ -144,8 +151,8 @@ class MicrostructureFeatureEngine:
         safe_std = max(std_ticks, self.z_std_floor_ticks)
         vwap_z = deviation_ticks / safe_std
 
-        obi_result = self.compute_obi(quote)
-        self._obi_history.append(obi_result.obi)
+        obi_result = self.compute_direct_obi(quote)
+        self._obi_history.append(obi_result.direct_obi)
 
         spread_ticks = order_book_from_quote(quote).spread_ticks
 
@@ -154,15 +161,38 @@ class MicrostructureFeatureEngine:
             mid=mid,
             vwap=vwap,
             vwap_z=vwap_z,
-            obi=obi_result.obi,
-            bid_qty=obi_result.bid_qty,
-            ask_qty=obi_result.ask_qty,
+            direct_obi=obi_result.direct_obi,
+            avg_bid_order_size=obi_result.avg_bid_order_size,
+            avg_ask_order_size=obi_result.avg_ask_order_size,
+            direct_bid_qty=obi_result.direct_bid_qty,
+            direct_ask_qty=obi_result.direct_ask_qty,
+            bid_order_count=obi_result.bid_order_count,
+            ask_order_count=obi_result.ask_order_count,
             realized_vol_ticks_1h=std_ticks,
             spread_ticks=spread_ticks,
             session_tag=self._session_tag(quote.timestamp),
         )
         self._snapshots.append(snapshot)
         return snapshot
+
+    def feature_table(self) -> tuple[dict[str, float | str], ...]:
+        """
+        Clean per-tick table with Level 1 OBI features (column order fixed).
+
+        Columns: ``timestamp``, ``direct_obi``, ``avg_bid_order_size``,
+        ``avg_ask_order_size``.
+        """
+        rows: list[dict[str, float | str]] = []
+        for snap in self._snapshots:
+            rows.append(
+                {
+                    "timestamp": snap.timestamp,
+                    "direct_obi": snap.direct_obi,
+                    "avg_bid_order_size": snap.avg_bid_order_size,
+                    "avg_ask_order_size": snap.avg_ask_order_size,
+                }
+            )
+        return tuple(rows)
 
     def process_quotes(self, quotes: list[Quote]) -> list[FeatureSnapshot]:
         """Batch-process a quote stream; returns aligned feature snapshot array."""

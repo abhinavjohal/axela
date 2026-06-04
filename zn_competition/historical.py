@@ -66,7 +66,7 @@ def generate_mock_order_book_stream(
     base_price: float = 112.0,
 ) -> list[Quote]:
     """
-    Deterministic mock L1+L2 book updates for offline strategy replay.
+    Deterministic mock Level 1 book updates for offline strategy replay.
 
     Alternates bid-heavy / ask-heavy windows to exercise OBI and churn paths.
     """
@@ -83,21 +83,24 @@ def generate_mock_order_book_stream(
         ask = round(mid + half_spread, 6)
 
         if i % 40 < 20:
-            bid_l1, ask_l1, bid_l2, ask_l2 = 70, 8, 55, 6
+            direct_bid_qty, direct_ask_qty = 125, 14
+            bid_order_count, ask_order_count = 18, 4
         elif i % 40 < 30:
-            bid_l1, ask_l1, bid_l2, ask_l2 = 8, 70, 6, 55
+            direct_bid_qty, direct_ask_qty = 14, 125
+            bid_order_count, ask_order_count = 4, 18
         else:
-            bid_l1, ask_l1, bid_l2, ask_l2 = 25, 25, 15, 15
+            direct_bid_qty, direct_ask_qty = 40, 40
+            bid_order_count, ask_order_count = 8, 8
 
         quotes.append(
             Quote(
                 timestamp=f"2026-06-03T14:{i % 60:02d}:{i % 60:02d}+00:00",
                 bid=bid,
                 ask=ask,
-                bid_size=bid_l1,
-                ask_size=ask_l1,
-                bid_l2_size=bid_l2,
-                ask_l2_size=ask_l2,
+                direct_bid_qty=direct_bid_qty,
+                direct_ask_qty=direct_ask_qty,
+                bid_order_count=bid_order_count,
+                ask_order_count=ask_order_count,
                 volume=1 + (i % 4),
             )
         )
@@ -126,10 +129,10 @@ def _build_context(
         weekly_min_remaining=max(0, weekly_min - ledger.leg_lots_traded),
         features=features,
         book=book,
-        bid_l1_size=quote.bid_size,
-        ask_l1_size=quote.ask_size,
-        bid_l2_size=quote.bid_l2_size,
-        ask_l2_size=quote.ask_l2_size,
+        direct_bid_qty=quote.direct_bid_qty,
+        direct_ask_qty=quote.direct_ask_qty,
+        bid_order_count=quote.bid_order_count,
+        ask_order_count=quote.ask_order_count,
         event_tag=tag,
         event_phase=phase,
         surprise_10y_equiv_bp=surprise,

@@ -18,7 +18,7 @@ from pathlib import Path
 from zn_competition.economics import FeeAccounting, analyze_week_plan
 from zn_competition.execution import execute_signal
 from zn_competition.features import MicrostructureFeatureEngine
-from zn_competition.microstructure import Quote, order_book_from_quote
+from zn_competition.microstructure import Quote, order_book_from_quote, parse_level1_from_mapping
 from zn_competition.risk import PositionLedger, RiskState
 from zn_competition.specs import (
     FEE_PER_LOT_PER_SIDE_USD,
@@ -31,10 +31,12 @@ from zn_competition.strategies.engine import StrategyStack
 REQUIRED_COLUMNS = frozenset({"timestamp", "bid", "ask"})
 OPTIONAL_COLUMNS = frozenset(
     {
+        "direct_bid_qty",
+        "direct_ask_qty",
+        "bid_order_count",
+        "ask_order_count",
         "bid_size",
         "ask_size",
-        "bid_l2_size",
-        "ask_l2_size",
         "last",
         "volume",
         "event_tag",
@@ -144,15 +146,20 @@ def load_quotes(path: Path) -> list[Quote]:
         for line_no, row in enumerate(reader, start=2):
             try:
                 last_raw = row.get("last", "").strip()
+                l1 = parse_level1_from_mapping(
+                    row,
+                    default_direct_bid_qty=10,
+                    default_direct_ask_qty=10,
+                )
                 quotes.append(
                     Quote(
                         timestamp=row["timestamp"].strip(),
                         bid=_parse_float(row, "bid"),
                         ask=_parse_float(row, "ask"),
-                        bid_size=_parse_int(row, "bid_size", 10),
-                        ask_size=_parse_int(row, "ask_size", 10),
-                        bid_l2_size=_parse_int(row, "bid_l2_size", 0),
-                        ask_l2_size=_parse_int(row, "ask_l2_size", 0),
+                        direct_bid_qty=l1.direct_bid_qty,
+                        direct_ask_qty=l1.direct_ask_qty,
+                        bid_order_count=l1.bid_order_count,
+                        ask_order_count=l1.ask_order_count,
                         last=float(last_raw) if last_raw else None,
                         volume=_parse_int(row, "volume", 1),
                     )
@@ -241,10 +248,10 @@ def run_backtest(
             weekly_min_remaining=max(0, weekly_min - ledger.leg_lots_traded),
             features=features,
             book=book,
-            bid_l1_size=quote.bid_size,
-            ask_l1_size=quote.ask_size,
-            bid_l2_size=quote.bid_l2_size,
-            ask_l2_size=quote.ask_l2_size,
+            direct_bid_qty=quote.direct_bid_qty,
+            direct_ask_qty=quote.direct_ask_qty,
+            bid_order_count=quote.bid_order_count,
+            ask_order_count=quote.ask_order_count,
             event_tag=tag,
             event_phase=phase,
             surprise_10y_equiv_bp=surprise,
@@ -318,8 +325,10 @@ def generate_synthetic_quotes(count: int = 500, base_price: float = 112.0) -> li
                 timestamp=f"2026-06-03T14:{i % 60:02d}:00+00:00",
                 bid=round(bid, 6),
                 ask=round(ask, 6),
-                bid_size=20 + (i % 5),
-                ask_size=18 + (i % 7),
+                direct_bid_qty=20 + (i % 5),
+                direct_ask_qty=18 + (i % 7),
+                bid_order_count=3 + (i % 4),
+                ask_order_count=2 + (i % 3),
                 volume=1 + (i % 3),
             )
         )

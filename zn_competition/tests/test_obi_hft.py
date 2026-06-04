@@ -1,4 +1,4 @@
-"""Tests for L1+L2 OBI HFT execution in volume_aware_mm."""
+"""Tests for Level 1 direct OBI HFT execution in volume_aware_mm."""
 
 from __future__ import annotations
 
@@ -24,10 +24,10 @@ def _bullish_book() -> OrderBookSnapshot:
         timestamp="2026-06-03T14:00:00+00:00",
         bid=112.0,
         ask=112.03125,
-        bid_l1_size=60,
-        ask_l1_size=5,
-        bid_l2_size=50,
-        ask_l2_size=5,
+        direct_bid_qty=110,
+        direct_ask_qty=10,
+        bid_order_count=20,
+        ask_order_count=5,
     )
 
 
@@ -36,15 +36,27 @@ def _bearish_flip_book() -> OrderBookSnapshot:
         timestamp="2026-06-03T14:00:01+00:00",
         bid=112.0,
         ask=112.03125,
-        bid_l1_size=5,
-        ask_l1_size=60,
-        bid_l2_size=5,
-        ask_l2_size=50,
+        direct_bid_qty=10,
+        direct_ask_qty=110,
+        bid_order_count=5,
+        ask_order_count=20,
+    )
+
+
+def _quote_from_book(book: OrderBookSnapshot) -> Quote:
+    return Quote(
+        book.timestamp,
+        book.bid,
+        book.ask,
+        direct_bid_qty=book.direct_bid_qty,
+        direct_ask_qty=book.direct_ask_qty,
+        bid_order_count=book.bid_order_count,
+        ask_order_count=book.ask_order_count,
     )
 
 
 class TestOrderBookImbalance(unittest.TestCase):
-    def test_l1_l2_obi_formula(self) -> None:
+    def test_direct_obi_formula(self) -> None:
         book = _bullish_book()
         obi = calculate_order_book_imbalance(book)
         self.assertAlmostEqual(obi, (110 - 10) / 120, places=6)
@@ -54,16 +66,8 @@ class TestOrderBookImbalance(unittest.TestCase):
         engine = OrderBookImbalanceHFT(quote_size=5)
         ledger = PositionLedger(position=8)
         book = _bullish_book()
-        quote = Quote(
-            book.timestamp,
-            book.bid,
-            book.ask,
-            book.bid_l1_size,
-            book.ask_l1_size,
-            book.bid_l2_size,
-            book.ask_l2_size,
-        )
-        result = engine.process_tick(quote, book, ledger)
+        quote = _quote_from_book(book)
+        engine.process_tick(quote, book, ledger)
         self.assertLessEqual(abs(ledger.position), MAX_POSITION_LOTS)
 
 
@@ -74,15 +78,7 @@ class TestOBIExecution(unittest.TestCase):
 
     def test_passive_bid_entry_at_inside(self) -> None:
         book = _bullish_book()
-        quote = Quote(
-            book.timestamp,
-            book.bid,
-            book.ask,
-            book.bid_l1_size,
-            book.ask_l1_size,
-            book.bid_l2_size,
-            book.ask_l2_size,
-        )
+        quote = _quote_from_book(book)
         result = self.engine.process_tick(quote, book, self.ledger)
         self.assertEqual(self.ledger.position, 1)
         self.assertEqual(self.ledger.avg_entry_price, book.inside_bid)
@@ -91,28 +87,12 @@ class TestOBIExecution(unittest.TestCase):
 
     def test_scratch_on_book_flip_costs_one_dollar_rt(self) -> None:
         book = _bullish_book()
-        quote = Quote(
-            book.timestamp,
-            book.bid,
-            book.ask,
-            book.bid_l1_size,
-            book.ask_l1_size,
-            book.bid_l2_size,
-            book.ask_l2_size,
-        )
+        quote = _quote_from_book(book)
         self.engine.process_tick(quote, book, self.ledger)
         self.assertEqual(self.ledger.position, 1)
 
         flip_book = _bearish_flip_book()
-        flip_quote = Quote(
-            flip_book.timestamp,
-            flip_book.bid,
-            flip_book.ask,
-            flip_book.bid_l1_size,
-            flip_book.ask_l1_size,
-            flip_book.bid_l2_size,
-            flip_book.ask_l2_size,
-        )
+        flip_quote = _quote_from_book(flip_book)
         scratch = self.engine.process_tick(flip_quote, flip_book, self.ledger)
         self.assertEqual(scratch.action, "scratch")
         self.assertEqual(self.ledger.position, 0)

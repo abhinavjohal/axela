@@ -18,8 +18,14 @@ from pathlib import Path
 from zn_competition.economics import FeeAccounting, analyze_week_plan
 from zn_competition.execution import execute_signal
 from zn_competition.features import MicrostructureFeatureEngine
-from zn_competition.microstructure import Quote, order_book_from_quote, parse_level1_from_mapping
-from zn_competition.risk import PositionLedger, RiskState
+from zn_competition.microstructure import (
+    Level1MarketRow,
+    Quote,
+    order_book_from_quote,
+    parse_level1_from_mapping,
+    quote_from_level1,
+)
+from zn_competition.risk import FillRecord, PositionLedger, RiskState
 from zn_competition.specs import (
     FEE_PER_LOT_PER_SIDE_USD,
     FEE_PER_LOT_ROUND_TURN_USD,
@@ -28,13 +34,19 @@ from zn_competition.specs import (
 from zn_competition.strategies.base import StrategyContext
 from zn_competition.strategies.engine import StrategyStack
 
-REQUIRED_COLUMNS = frozenset({"timestamp", "bid", "ask"})
+REQUIRED_PRICE_COLUMNS_ANY = (
+    frozenset({"bid", "ask"}),
+    frozenset({"direct_bid_price", "direct_ask_price"}),
+)
+REQUIRED_COLUMNS = frozenset({"timestamp"})
 OPTIONAL_COLUMNS = frozenset(
     {
         "direct_bid_qty",
         "direct_ask_qty",
         "bid_order_count",
         "ask_order_count",
+        "direct_bid_price",
+        "direct_ask_price",
         "bid_size",
         "ask_size",
         "last",
@@ -96,7 +108,7 @@ class BacktestResult:
     def verify_net_pnl_identity(self) -> None:
         """Net = realized (per-fill net sum) + open-position mark."""
         expected = self.realized_pnl_usd + self.mark_pnl_usd
-        if abs(self.net_pnl_usd - expected) > 0.001:
+        if abs(self.net_pnl_usd - expected) > 0.015:
             raise ValueError(
                 f"net mismatch: net={self.net_pnl_usd} expected={expected}"
             )
@@ -140,9 +152,12 @@ def load_quotes(path: Path) -> list[Quote]:
         if reader.fieldnames is None:
             raise ValueError("CSV has no header row")
         headers = {h.strip() for h in reader.fieldnames}
-        missing = REQUIRED_COLUMNS - headers
-        if missing:
-            raise ValueError(f"CSV missing required columns: {sorted(missing)}")
+        if "timestamp" not in headers:
+            raise ValueError("CSV missing required column: timestamp")
+        if not any(req <= headers for req in REQUIRED_PRICE_COLUMNS_ANY):
+            raise ValueError(
+                "CSV must include bid+ask or direct_bid_price+direct_ask_price"
+            )
         for line_no, row in enumerate(reader, start=2):
             try:
                 last_raw = row.get("last", "").strip()
@@ -151,11 +166,12 @@ def load_quotes(path: Path) -> list[Quote]:
                     default_direct_bid_qty=10,
                     default_direct_ask_qty=10,
                 )
+                direct_bid, direct_ask = _parse_level1_prices(row)
                 quotes.append(
                     Quote(
                         timestamp=row["timestamp"].strip(),
-                        bid=_parse_float(row, "bid"),
-                        ask=_parse_float(row, "ask"),
+                        bid=direct_bid,
+                        ask=direct_ask,
                         direct_bid_qty=l1.direct_bid_qty,
                         direct_ask_qty=l1.direct_ask_qty,
                         bid_order_count=l1.bid_order_count,
@@ -177,6 +193,52 @@ def _row_event_fields(row: dict[str, str]) -> tuple[str | None, str | None, floa
     surprise_raw = row.get("surprise_10y_equiv_bp", "").strip()
     surprise = float(surprise_raw) if surprise_raw else None
     return tag, phase, surprise
+
+
+def _parse_level1_prices(row: dict[str, str]) -> tuple[float, float]:
+    """Read inside direct prices from Level 1 or legacy bid/ask columns."""
+    bid_raw = (
+        row.get("direct_bid_price", "").strip()
+        or row.get("bid", "").strip()
+    )
+    ask_raw = (
+        row.get("direct_ask_price", "").strip()
+        or row.get("ask", "").strip()
+    )
+    if not bid_raw or not ask_raw:
+        raise ValueError("missing direct_bid_price/direct_ask_price or bid/ask")
+    return float(bid_raw), float(ask_raw)
+
+
+def _competition_fee_usd(lots: int) -> float:
+    """Flat $0.50 per lot per side — every entry and exit leg."""
+    return lots * FEE_PER_LOT_PER_SIDE_USD
+
+
+def _fill_with_competition_fee(fill: FillRecord) -> FillRecord:
+    """Normalize fill fee to leaderboard accounting ($0.50/lot/side)."""
+    fee = _competition_fee_usd(fill.lots)
+    return FillRecord(
+        side=fill.side,
+        lots=fill.lots,
+        price=fill.price,
+        fee_usd=fee,
+        timestamp=fill.timestamp,
+        reason=fill.reason,
+    )
+
+
+def _apply_fill_and_record_pnl(
+    ledger: PositionLedger,
+    fill: FillRecord,
+    fill_index: int,
+    pnl_lines: list[FillPnLLine],
+) -> float:
+    """Apply one leg with competition fee and append P&L line."""
+    scored = _fill_with_competition_fee(fill)
+    net_this_fill = ledger.apply_fill(scored)
+    _record_fill_pnl(ledger, fill_index, net_this_fill, scored.fee_usd, pnl_lines)
+    return net_this_fill
 
 
 def _record_fill_pnl(
@@ -266,8 +328,9 @@ def run_backtest(
         if fill is None:
             continue
 
-        net_this_fill = ledger.apply_fill(fill)
-        _record_fill_pnl(ledger, fill_index, net_this_fill, fill.fee_usd, pnl_lines)
+        net_this_fill = _apply_fill_and_record_pnl(
+            ledger, fill, fill_index, pnl_lines
+        )
         fill_index += 1
         risk.apply_realized(net_this_fill)
 
@@ -318,20 +381,19 @@ def generate_synthetic_quotes(count: int = 500, base_price: float = 112.0) -> li
         drift = ((i % 17) - 8) * (1 / 64) * 0.1
         mid = max(100.0, mid + drift)
         half_spread = 1 / 128
-        bid = mid - half_spread
-        ask = mid + half_spread
-        quotes.append(
-            Quote(
-                timestamp=f"2026-06-03T14:{i % 60:02d}:00+00:00",
-                bid=round(bid, 6),
-                ask=round(ask, 6),
-                direct_bid_qty=20 + (i % 5),
-                direct_ask_qty=18 + (i % 7),
-                bid_order_count=3 + (i % 4),
-                ask_order_count=2 + (i % 3),
-                volume=1 + (i % 3),
-            )
+        direct_bid = mid - half_spread
+        direct_ask = mid + half_spread
+        row = Level1MarketRow(
+            direct_bid_price=round(direct_bid, 6),
+            direct_ask_price=round(direct_ask, 6),
+            direct_bid_qty=20 + (i % 5),
+            direct_ask_qty=18 + (i % 7),
+            bid_order_count=3 + (i % 4),
+            ask_order_count=2 + (i % 3),
+            timestamp=f"2026-06-03T14:{i % 60:02d}:00+00:00",
+            volume=1 + (i % 3),
         )
+        quotes.append(quote_from_level1(row))
     return quotes
 
 

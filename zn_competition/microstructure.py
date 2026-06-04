@@ -11,9 +11,40 @@ from math import sqrt
 from zn_competition.specs import TICK_SIZE_FLOAT, ZN_SEP26
 
 # TT ADL Level 1 field names (inside market direct quantities + order counts).
+LEVEL1_PRICE_FIELDS = frozenset({"direct_bid_price", "direct_ask_price"})
 LEVEL1_QTY_FIELDS = frozenset({"direct_bid_qty", "direct_ask_qty"})
 LEVEL1_COUNT_FIELDS = frozenset({"bid_order_count", "ask_order_count"})
 LEVEL1_LEGACY_QTY_ALIASES = frozenset({"bid_size", "ask_size"})
+LEVEL1_LEGACY_PRICE_ALIASES = frozenset({"bid", "ask"})
+
+
+@dataclass(frozen=True)
+class Level1MarketRow:
+    """
+    TT ADL Level 1 inside-market columns (no multi-depth book).
+
+    Columns: ``direct_bid_price``, ``direct_ask_price``, ``direct_bid_qty``,
+    ``direct_ask_qty``, ``bid_order_count``, ``ask_order_count``.
+    """
+
+    direct_bid_price: float
+    direct_ask_price: float
+    direct_bid_qty: int
+    direct_ask_qty: int
+    bid_order_count: int
+    ask_order_count: int
+    timestamp: str = "2026-06-03T14:00:00+00:00"
+    volume: int = 1
+
+    def __post_init__(self) -> None:
+        if self.direct_bid_price <= 0 or self.direct_ask_price <= 0:
+            raise ValueError("direct bid/ask prices must be positive")
+        if self.direct_ask_price < self.direct_bid_price:
+            raise ValueError("direct_ask_price must be >= direct_bid_price")
+        if self.direct_bid_qty < 0 or self.direct_ask_qty < 0:
+            raise ValueError("direct quantities must be non-negative")
+        if self.bid_order_count < 0 or self.ask_order_count < 0:
+            raise ValueError("order counts must be non-negative")
 
 
 @dataclass(frozen=True)
@@ -50,6 +81,14 @@ class Quote:
 
     def round_mid_to_tick(self) -> float:
         return ZN_SEP26.round_price_to_tick(self.mid)
+
+    @property
+    def direct_bid_price(self) -> float:
+        return self.bid
+
+    @property
+    def direct_ask_price(self) -> float:
+        return self.ask
 
 
 @dataclass(frozen=True)
@@ -89,6 +128,33 @@ class OrderBookSnapshot:
     @property
     def spread_ticks(self) -> float:
         return ZN_SEP26.price_delta_to_ticks(self.ask - self.bid)
+
+    @property
+    def direct_bid_price(self) -> float:
+        return self.bid
+
+    @property
+    def direct_ask_price(self) -> float:
+        return self.ask
+
+
+def quote_from_level1(row: Level1MarketRow) -> Quote:
+    """Build a ``Quote`` from explicit Level 1 ADL columns."""
+    return Quote(
+        timestamp=row.timestamp,
+        bid=ZN_SEP26.round_price_to_tick(row.direct_bid_price),
+        ask=ZN_SEP26.round_price_to_tick(row.direct_ask_price),
+        direct_bid_qty=row.direct_bid_qty,
+        direct_ask_qty=row.direct_ask_qty,
+        bid_order_count=row.bid_order_count,
+        ask_order_count=row.ask_order_count,
+        volume=row.volume,
+    )
+
+
+def book_from_level1(row: Level1MarketRow) -> OrderBookSnapshot:
+    """Build an ``OrderBookSnapshot`` from explicit Level 1 ADL columns."""
+    return order_book_from_quote(quote_from_level1(row))
 
 
 def _avg_order_size(qty: int, order_count: int) -> float:

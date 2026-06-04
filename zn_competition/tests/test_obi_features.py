@@ -1,4 +1,4 @@
-"""OBI calculator and feature pipeline tests."""
+"""OBI calculator and feature pipeline tests (Level 1 columns only)."""
 
 from __future__ import annotations
 
@@ -10,14 +10,21 @@ from zn_competition.features import (
     OBIHistoryBuffer,
 )
 from zn_competition.microstructure import (
+    Level1MarketRow,
     OrderBookImbalanceCalculator,
-    OrderBookSnapshot,
-    Quote,
+    book_from_level1,
     calculate_direct_obi,
     calculate_order_book_imbalance,
     parse_level1_book_fields,
+    quote_from_level1,
 )
 from zn_competition.specs import TICK_SIZE_FLOAT, ZN_SEP26
+from zn_competition.tests.level1_fixtures import (
+    FEATURE_STREAM_L1,
+    ONE_TICK_SPREAD_L1,
+    OBI_TABLE_L1,
+    l1_quote,
+)
 
 
 class TestDirectOBIParser(unittest.TestCase):
@@ -37,11 +44,22 @@ class TestDirectOBIParser(unittest.TestCase):
         self.assertEqual(result.avg_ask_order_size, 0.0)
 
     def test_snapshot_equivalence(self) -> None:
-        book = OrderBookSnapshot("t", 112.0, 112.03125, 110, 10, 20, 5)
+        row = Level1MarketRow(
+            direct_bid_price=112.0,
+            direct_ask_price=112.03125,
+            direct_bid_qty=110,
+            direct_ask_qty=10,
+            bid_order_count=20,
+            ask_order_count=5,
+            timestamp="t",
+        )
+        book = book_from_level1(row)
         self.assertAlmostEqual(
             calculate_order_book_imbalance(book),
             OrderBookImbalanceCalculator.from_snapshot(book).direct_obi,
         )
+        self.assertEqual(book.direct_bid_price, row.direct_bid_price)
+        self.assertEqual(book.direct_ask_price, row.direct_ask_price)
 
     def test_calculator_from_quantities(self) -> None:
         result = OrderBookImbalanceCalculator.from_quantities(80, 20, 4, 2)
@@ -54,16 +72,7 @@ class TestFeaturePipelineOBI(unittest.TestCase):
     def test_obi_history_array(self) -> None:
         engine = MicrostructureFeatureEngine(obi_history_length=10)
         quotes = [
-            Quote(
-                f"t{i}",
-                112.0,
-                112.03125,
-                direct_bid_qty=70,
-                direct_ask_qty=10,
-                bid_order_count=7,
-                ask_order_count=2,
-            )
-            for i in range(5)
+            l1_quote(FEATURE_STREAM_L1, timestamp=f"t{i}") for i in range(5)
         ]
         snapshots = engine.process_quotes(quotes)
         self.assertEqual(len(snapshots), 5)
@@ -73,15 +82,7 @@ class TestFeaturePipelineOBI(unittest.TestCase):
 
     def test_feature_table_columns(self) -> None:
         engine = MicrostructureFeatureEngine()
-        quote = Quote(
-            "t",
-            112.0,
-            112.03125,
-            direct_bid_qty=100,
-            direct_ask_qty=50,
-            bid_order_count=10,
-            ask_order_count=5,
-        )
+        quote = quote_from_level1(OBI_TABLE_L1)
         engine.update(quote)
         table = engine.feature_table()
         self.assertEqual(len(table), 1)
@@ -92,16 +93,24 @@ class TestFeaturePipelineOBI(unittest.TestCase):
         self.assertAlmostEqual(row["avg_ask_order_size"], 10.0)
 
     def test_spread_uses_zn_tick_size(self) -> None:
-        quote = Quote("t", 112.0, 112.0 + TICK_SIZE_FLOAT, 10, 10)
+        quote = quote_from_level1(ONE_TICK_SPREAD_L1)
         snap = MicrostructureFeatureEngine().update(quote)
         self.assertAlmostEqual(snap.spread_ticks, 1.0, places=4)
 
     def test_vol_uses_zn_tick_size(self) -> None:
         engine = MicrostructureFeatureEngine(vol_window=5)
-        q1 = Quote("t1", 112.0, 112.03125, 10, 10)
-        q2 = Quote("t2", 112.0 + TICK_SIZE_FLOAT, 112.03125 + TICK_SIZE_FLOAT, 10, 10)
+        q1 = quote_from_level1(ONE_TICK_SPREAD_L1)
+        q2 = Level1MarketRow(
+            direct_bid_price=112.0 + TICK_SIZE_FLOAT,
+            direct_ask_price=112.0 + 2 * TICK_SIZE_FLOAT,
+            direct_bid_qty=10,
+            direct_ask_qty=10,
+            bid_order_count=2,
+            ask_order_count=2,
+            timestamp="t2",
+        )
         engine.update(q1)
-        snap = engine.update(q2)
+        snap = engine.update(quote_from_level1(q2))
         self.assertGreater(snap.realized_vol_ticks_1h, 0.0)
         self.assertAlmostEqual(ZN_SEP26.price_delta_to_ticks(TICK_SIZE_FLOAT), 1.0)
 

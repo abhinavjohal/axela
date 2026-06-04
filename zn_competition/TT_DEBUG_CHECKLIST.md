@@ -24,6 +24,8 @@ Use this before Week 1 (200 lots). One wrong setting destroys edge faster than a
 ## 4. Risk on TT
 
 - [ ] Max position **10** — set TT Risk Guardian hard cap.
+- [ ] Wire **Position Risk Block** + **LessThan_Guard** (ADL §4.0) — Python parity: `PositionGuard` in `risk.py` + `place_discrete_order()` in `execution.py`.
+- [ ] Discrete Order block inputs: **Instrument** = ZN Sep26, **Price**, **Quantity**, **Trigger** — must pass guard before route.
 - [ ] Daily loss stop (suggest $1,500–$2,500 Week 1 while debugging).
 - [ ] Disable trading 2 min before/after major releases until macro sleeve is tested.
 

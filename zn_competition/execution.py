@@ -14,6 +14,7 @@ from zn_competition.risk import (
     ExecutionRiskException,
     FillRecord,
     OrderRequest,
+    PositionGuard,
     PositionLedger,
     assert_ledger_position_valid,
     gate_order_submission,
@@ -34,6 +35,38 @@ class StrategyRegime(str, Enum):
     NEUTRAL = "neutral"
 
 
+@dataclass(frozen=True)
+class DiscreteOrderInputs:
+    """
+    TT ADL Discrete Order block inputs (field-for-field mapping).
+
+    | ADL pin      | Field        |
+    |--------------|--------------|
+    | Instrument   | ``instrument`` |
+    | Price        | ``price``      |
+    | Quantity     | ``quantity``   |
+    | Trigger/Enable | ``trigger``  |
+    """
+
+    instrument: str
+    price: float
+    quantity: int
+    trigger: bool
+    side: Side
+    reason: str = ""
+    urgency: str = "passive"
+
+    def __post_init__(self) -> None:
+        if self.price <= 0:
+            raise ValueError(f"price must be positive, got {self.price}")
+        if self.quantity < 0:
+            raise ValueError(f"quantity must be non-negative, got {self.quantity}")
+        if self.side != Side.FLAT and self.quantity == 0:
+            raise ValueError("BUY/SELL require positive quantity")
+        if self.urgency not in ("passive", "aggressive"):
+            raise ValueError(f"urgency must be passive|aggressive, got {self.urgency}")
+
+
 @dataclass
 class WorkingOrder:
     """Passive/working order tracked before exchange fill (sim layer)."""
@@ -44,6 +77,8 @@ class WorkingOrder:
     strategy_name: str
     urgency: str
     timestamp: str
+    instrument: str = ZN_SEP26.tt_instrument
+    limit_price: float = 0.0
     canceled: bool = False
 
     @property
@@ -61,11 +96,12 @@ class PurgeReport:
 @dataclass
 class ExecutionEngine:
     """
-    Core execution path: risk gate → working-order book → fill simulation.
+    Core execution path: PositionGuard → Discrete Order → fill simulation.
 
-    All submissions read ``ledger.position`` from ``risk.py`` before sending.
+    All submissions sync ``PositionGuard`` from ``ledger.position`` before routing.
     """
 
+    position_guard: PositionGuard = field(default_factory=PositionGuard)
     _working_orders: dict[str, WorkingOrder] = field(default_factory=dict)
 
     def active_working_orders(self) -> list[WorkingOrder]:
@@ -78,6 +114,9 @@ class ExecutionEngine:
         strategy_name: str,
         urgency: str,
         timestamp: str,
+        *,
+        instrument: str = ZN_SEP26.tt_instrument,
+        limit_price: float = 0.0,
     ) -> WorkingOrder:
         order_id = str(uuid4())
         working = WorkingOrder(
@@ -87,6 +126,8 @@ class ExecutionEngine:
             strategy_name=strategy_name,
             urgency=urgency,
             timestamp=timestamp,
+            instrument=instrument,
+            limit_price=limit_price,
         )
         self._working_orders[order_id] = working
         return working
@@ -132,6 +173,86 @@ class ExecutionEngine:
             return self.purge_regime(StrategyRegime.TREND_FOLLOWING)
         return None
 
+    def place_discrete_order(
+        self,
+        ledger: PositionLedger,
+        order_inputs: DiscreteOrderInputs,
+        quote: Quote,
+        *,
+        regime: StrategyRegime = StrategyRegime.NEUTRAL,
+        strategy_name: str = "",
+        register_working: bool = False,
+    ) -> FillRecord | None:
+        """
+        Route one order through PositionGuard then simulate exchange fill.
+
+        ADL Discrete Order block sequence:
+          1. ``trigger`` False → skip (no route)
+          2. Sync net position from ledger
+          3. PositionGuard / LessThan_Guard on ``quantity``
+          4. On breach → cancel transaction, raise ``ExecutionRiskException``
+          5. On pass → simulate fill at ``price``
+        """
+        if not order_inputs.trigger:
+            logger.info(
+                "EXECUTION_SKIP: trigger=False instrument=%s qty=%s side=%s",
+                order_inputs.instrument,
+                order_inputs.quantity,
+                order_inputs.side.value,
+            )
+            return None
+
+        if order_inputs.instrument != ZN_SEP26.tt_instrument:
+            msg = (
+                f"ORDER_REJECTED: instrument {order_inputs.instrument!r} != "
+                f"competition contract {ZN_SEP26.tt_instrument!r}"
+            )
+            logger.error("EXECUTION_CANCEL: %s", msg)
+            raise ExecutionRiskException(msg)
+
+        assert_ledger_position_valid(ledger)
+        current_position = get_current_position(ledger)
+        self.position_guard.sync_from_ledger(ledger)
+
+        self.position_guard.validate_submission(
+            current_position,
+            order_inputs.quantity,
+            order_inputs.side,
+        )
+
+        order = OrderRequest(
+            side=order_inputs.side,
+            lots=order_inputs.quantity,
+            reason=order_inputs.reason,
+        )
+        validate_order(current_position, order)
+
+        if (
+            register_working
+            and order.side in (Side.BUY, Side.SELL)
+            and order_inputs.urgency == "passive"
+        ):
+            self.register_working_order(
+                order,
+                regime,
+                strategy_name,
+                order_inputs.urgency,
+                quote.timestamp,
+                instrument=order_inputs.instrument,
+                limit_price=order_inputs.price,
+            )
+
+        fill = execute_order(
+            order,
+            quote,
+            current_position,
+            order_inputs.urgency,
+            limit_price=ZN_SEP26.round_price_to_tick(order_inputs.price),
+        )
+        ledger.apply_fill(fill)
+        self.position_guard.sync_from_ledger(ledger)
+        return fill
+
     def submit_order(
         self,
         ledger: PositionLedger,
@@ -142,26 +263,33 @@ class ExecutionEngine:
         regime: StrategyRegime = StrategyRegime.NEUTRAL,
         strategy_name: str = "",
         register_working: bool = False,
-    ) -> FillRecord:
+        trigger: bool = True,
+    ) -> FillRecord | None:
         """
-        Submit one order through the strict risk gate, then simulate fill.
+        Legacy submit path — builds ``DiscreteOrderInputs`` from quote + order.
 
-        Reads current position from ``ledger`` before any action.
+        Prefer ``place_discrete_order`` when Instrument/Price/Quantity/Trigger
+        are already resolved (ADL canvas parity).
         """
-        assert_ledger_position_valid(ledger)
         current_position = get_current_position(ledger)
-
-        gate_order_submission(current_position, order.lots, order.side)
-        validate_order(current_position, order)
-
-        if register_working and order.side in (Side.BUY, Side.SELL) and urgency == "passive":
-            self.register_working_order(
-                order, regime, strategy_name, urgency, quote.timestamp
-            )
-
-        fill = execute_order(order, quote, current_position, urgency)
-        ledger.apply_fill(fill)
-        return fill
+        price = _resolve_order_price(order, quote, urgency, current_position)
+        discrete = DiscreteOrderInputs(
+            instrument=ZN_SEP26.tt_instrument,
+            price=price,
+            quantity=order.lots,
+            trigger=trigger,
+            side=order.side,
+            reason=order.reason,
+            urgency=urgency,
+        )
+        return self.place_discrete_order(
+            ledger,
+            discrete,
+            quote,
+            regime=regime,
+            strategy_name=strategy_name,
+            register_working=register_working,
+        )
 
     def submit_signal(
         self,
@@ -171,11 +299,15 @@ class ExecutionEngine:
         *,
         regime: StrategyRegime = StrategyRegime.NEUTRAL,
         strategy_name: str = "",
+        trigger: bool = True,
     ) -> FillRecord | None:
         order = signal_to_order(signal, get_current_position(ledger))
         if order is None:
             return None
-        register_working = signal.urgency == "passive" and signal.side in (Side.BUY, Side.SELL)
+        register_working = signal.urgency == "passive" and signal.side in (
+            Side.BUY,
+            Side.SELL,
+        )
         return self.submit_order(
             ledger,
             order,
@@ -184,7 +316,25 @@ class ExecutionEngine:
             regime=regime,
             strategy_name=strategy_name,
             register_working=register_working,
+            trigger=trigger,
         )
+
+
+def _resolve_order_price(
+    order: OrderRequest,
+    quote: Quote,
+    urgency: str,
+    position: int,
+) -> float:
+    if order.side == Side.FLAT:
+        side_str = "SELL" if position > 0 else "BUY"
+        if urgency == "aggressive":
+            return aggressive_fill_price(side_str, quote)
+        return passive_fill_price(side_str, quote)
+    side_str = order.side.value
+    if urgency == "aggressive":
+        return aggressive_fill_price(side_str, quote)
+    return passive_fill_price(side_str, quote)
 
 
 def signal_to_order(signal: Signal, position: int) -> OrderRequest | None:
@@ -203,31 +353,28 @@ def execute_order(
     quote: Quote,
     position: int,
     urgency: str,
+    *,
+    limit_price: float | None = None,
 ) -> FillRecord:
-    """Build fill after gate passed (internal — use ``ExecutionEngine.submit_order``)."""
-    if order.side == Side.FLAT:
+    """Build fill after gate passed (internal — use ``ExecutionEngine.place_discrete_order``)."""
+    if limit_price is not None:
+        price = limit_price
+    elif order.side == Side.FLAT:
         side_str = "SELL" if position > 0 else "BUY"
         price = (
             aggressive_fill_price(side_str, quote)
             if urgency == "aggressive"
             else passive_fill_price(side_str, quote)
         )
-        return FillRecord(
-            side=Side.FLAT,
-            lots=order.lots,
-            price=ZN_SEP26.round_price_to_tick(price),
-            fee_usd=order.lots * FEE_PER_LOT_PER_SIDE_USD,
-            timestamp=quote.timestamp,
-            reason=order.reason,
-        )
-
-    side_str = order.side.value
-    if urgency == "aggressive":
-        price = aggressive_fill_price(side_str, quote)
-    elif urgency == "passive":
-        price = passive_fill_price(side_str, quote)
     else:
-        raise ValueError(f"unknown urgency: {urgency}")
+        side_str = order.side.value
+        if urgency == "aggressive":
+            price = aggressive_fill_price(side_str, quote)
+        elif urgency == "passive":
+            price = passive_fill_price(side_str, quote)
+        else:
+            raise ValueError(f"unknown urgency: {urgency}")
+        price = ZN_SEP26.round_price_to_tick(price)
 
     return FillRecord(
         side=order.side,
@@ -251,3 +398,26 @@ def execute_signal(
     gate_order_submission(position, order.lots, order.side)
     validate_order(position, order)
     return execute_order(order, quote, position, signal.urgency)
+
+
+def discrete_order_from_signal(
+    signal: Signal,
+    quote: Quote,
+    position: int,
+    *,
+    trigger: bool = True,
+) -> DiscreteOrderInputs | None:
+    """Build ADL Discrete Order inputs from a strategy signal."""
+    order = signal_to_order(signal, position)
+    if order is None:
+        return None
+    price = _resolve_order_price(order, quote, signal.urgency, position)
+    return DiscreteOrderInputs(
+        instrument=ZN_SEP26.tt_instrument,
+        price=price,
+        quantity=order.lots,
+        trigger=trigger,
+        side=order.side,
+        reason=order.reason,
+        urgency=signal.urgency,
+    )

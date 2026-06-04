@@ -21,7 +21,7 @@ class TestExecutionCap(unittest.TestCase):
     def test_enforce_raises_on_breach(self) -> None:
         with self.assertRaises(ExecutionRiskException) as ctx:
             enforce_order_size(5, position=8, side=Side.BUY)
-        self.assertIn("POSITION_CAP", str(ctx.exception))
+        self.assertIn("POSITION_GUARD", str(ctx.exception))
 
     def test_validate_order_raises_execution_exception(self) -> None:
         from zn_competition.risk import OrderRequest

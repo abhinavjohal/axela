@@ -93,34 +93,126 @@ def gate_order_submission(
     """
     Strict competition gate before the execution engine accepts an order.
 
+    Delegates to ``PositionGuard`` (TT ADL PositionRisk + LessThan_Guard parity).
     Blocks when ``ABS(current_position + signed_incoming_lots) > MAX_POSITION_LOTS``.
-
-    ``incoming_order_lots`` is the unsigned order quantity; sign comes from ``side``.
     """
-    if incoming_order_lots <= 0 and side != Side.FLAT:
-        msg = f"ORDER_REJECTED: lot size must be positive, got {incoming_order_lots}"
-        logger.error("EXECUTION_RISK: %s", msg)
-        raise ExecutionRiskException(msg)
+    _DEFAULT_POSITION_GUARD.validate_submission(
+        current_position, incoming_order_lots, side
+    )
 
-    if abs(current_position) > MAX_POSITION_LOTS:
-        msg = (
-            f"POSITION_CAP: current position {current_position} exceeds "
-            f"maximum {MAX_POSITION_LOTS} lots"
+
+@dataclass
+class PositionGuard:
+    """
+    Tracks signed net position and enforces the ±10-lot cap before routing.
+
+    Python mirror of TT ADL **PositionRisk Block** + **LessThan_Guard** (see
+    ``TT_ADL_SPECIFICATION.md`` §4.0): projected exposure must satisfy
+    ``ABS(net_position + signed_incoming) <= max_position_lots``.
+    """
+
+    max_position_lots: int = MAX_POSITION_LOTS
+    _net_position: int = 0
+
+    def __post_init__(self) -> None:
+        if self.max_position_lots < 1:
+            raise ValueError(
+                f"max_position_lots must be >= 1, got {self.max_position_lots}"
+            )
+
+    @property
+    def net_position(self) -> int:
+        """Signed net lots (long positive, short negative)."""
+        return self._net_position
+
+    @property
+    def abs_net_position(self) -> int:
+        """Absolute net exposure — ``ABS(net_position)``."""
+        return abs(self._net_position)
+
+    def sync_from_ledger(self, ledger: PositionLedger) -> int:
+        """Refresh internal position from ``PositionLedger`` (exchange truth)."""
+        self._net_position = ledger.position
+        return self._net_position
+
+    def projected_net_position(
+        self,
+        incoming_lots: int,
+        side: Side,
+        *,
+        current_position: int | None = None,
+    ) -> int:
+        """Net position after applying ``incoming_lots`` on ``side``."""
+        base = self._net_position if current_position is None else current_position
+        signed = signed_incoming_lots(side, incoming_lots, base)
+        return base + signed
+
+    def less_than_guard_passes(
+        self,
+        incoming_lots: int,
+        side: Side,
+        *,
+        current_position: int | None = None,
+    ) -> bool:
+        """
+        ADL LessThan_Guard: ``ABS(projected_net) <= max_position_lots``.
+        """
+        projected = self.projected_net_position(
+            incoming_lots, side, current_position=current_position
         )
-        logger.error("EXECUTION_RISK: %s", msg)
-        raise ExecutionRiskException(msg)
+        return abs(projected) <= self.max_position_lots
 
-    signed_delta = signed_incoming_lots(side, incoming_order_lots, current_position)
-    projected_sum = current_position + signed_delta
+    def validate_submission(
+        self,
+        current_position: int,
+        incoming_lots: int,
+        side: Side,
+    ) -> None:
+        """
+        Raise ``ExecutionRiskException`` if order would breach the position cap.
 
-    if abs(projected_sum) > MAX_POSITION_LOTS:
-        msg = (
-            f"POSITION_CAP: ABS({current_position} + {signed_delta}) = "
-            f"{abs(projected_sum)} > {MAX_POSITION_LOTS} "
-            f"(side={side.value}, incoming_lots={incoming_order_lots})"
+        Matches ADL check before Discrete Order routing::
+            ABS(current_position + signed_incoming_lots) > max → cancel
+        """
+        if incoming_lots <= 0 and side != Side.FLAT:
+            msg = f"ORDER_REJECTED: lot size must be positive, got {incoming_lots}"
+            logger.error("POSITION_GUARD: %s", msg)
+            raise ExecutionRiskException(msg)
+
+        if abs(current_position) > self.max_position_lots:
+            msg = (
+                f"POSITION_GUARD: current net position {current_position} exceeds "
+                f"maximum {self.max_position_lots} lots"
+            )
+            logger.error("POSITION_GUARD: %s", msg)
+            raise ExecutionRiskException(msg)
+
+        signed = signed_incoming_lots(side, incoming_lots, current_position)
+        projected = current_position + signed
+
+        if abs(projected) > self.max_position_lots:
+            msg = (
+                f"POSITION_GUARD: LessThan_Guard failed — "
+                f"ABS({current_position} + {signed}) = {abs(projected)} > "
+                f"{self.max_position_lots} "
+                f"(side={side.value}, incoming_lots={incoming_lots})"
+            )
+            logger.error("POSITION_GUARD: %s — order canceled before routing", msg)
+            raise ExecutionRiskException(msg)
+
+    def record_fill(self, side: Side, lots: int, position_before: int) -> None:
+        """Update tracked net position after a confirmed fill."""
+        self._net_position = position_before + signed_incoming_lots(
+            side, lots, position_before
         )
-        logger.error("EXECUTION_RISK: %s", msg)
-        raise ExecutionRiskException(msg)
+
+
+_DEFAULT_POSITION_GUARD = PositionGuard()
+
+
+def get_position_guard() -> PositionGuard:
+    """Shared guard instance used by ``gate_order_submission``."""
+    return _DEFAULT_POSITION_GUARD
 
 
 def clip_order_size(requested: int, position: int) -> int:

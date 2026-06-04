@@ -30,8 +30,14 @@ from zn_competition.specs import (
     ZN_SEP26,
 )
 from zn_competition.strategies.base import Side, Signal, StrategyContext
+from zn_competition.strategies.obi_regime import (
+    OBIRegimeMode,
+    OBIRegimeSnapshot,
+    SNIPER_THRESHOLD,
+    VOLUME_THRESHOLD,
+)
 
-# OBI thresholds (HFT)
+# Legacy default for unit tests and static HFT instances
 OBI_ENTRY_THRESHOLD = 0.7
 OBI_FLIP_AGAINST_THRESHOLD = -0.7
 OBI_SHORT_ENTRY_THRESHOLD = -0.7
@@ -102,6 +108,18 @@ class OrderBookImbalanceHFT:
         self._working_order = None
         self._open_trade = None
 
+    def configure_thresholds(self, entry_threshold: float) -> None:
+        """Set symmetric long/short entry and flip thresholds for this bar."""
+        self.entry_threshold = entry_threshold
+        self.flip_threshold = -entry_threshold
+        self.short_entry_threshold = -entry_threshold
+
+    def cancel_stale_resting_orders(self) -> bool:
+        """Drop unfilled working limits (e.g. on dual-regime clock shift)."""
+        had_order = self._working_order is not None
+        self._working_order = None
+        return had_order
+
     def book_from_context(self, ctx: StrategyContext) -> OrderBookSnapshot:
         if ctx.book is not None:
             return ctx.book
@@ -138,7 +156,7 @@ class OrderBookImbalanceHFT:
         if self._working_order is not None:
             return None
 
-        if obi > self.entry_threshold and position < MAX_POSITION_LOTS:
+        if obi >= self.entry_threshold and position < MAX_POSITION_LOTS:
             lots = clip_order_size(self.quote_size, position)
             if lots <= 0:
                 return None
@@ -151,7 +169,7 @@ class OrderBookImbalanceHFT:
                 max_hold_seconds=30,
             )
 
-        if obi < self.short_entry_threshold and position > -MAX_POSITION_LOTS:
+        if obi <= self.short_entry_threshold and position > -MAX_POSITION_LOTS:
             lots = clip_order_size(self.quote_size, position)
             if lots <= 0:
                 return None
@@ -207,7 +225,10 @@ class OrderBookImbalanceHFT:
         if self._open_trade is not None or self._working_order is not None:
             return result
 
-        if obi > self.entry_threshold and position < MAX_POSITION_LOTS:
+        if not self._allows_new_entries():
+            return result
+
+        if obi >= self.entry_threshold and position < MAX_POSITION_LOTS:
             order = self._place_passive_bid(quote, book, ledger, obi)
             if order is not None:
                 self._working_order = order
@@ -219,7 +240,7 @@ class OrderBookImbalanceHFT:
                     result.action = "working_passive_bid"
             return result
 
-        if obi < self.short_entry_threshold and position > -MAX_POSITION_LOTS:
+        if obi <= self.short_entry_threshold and position > -MAX_POSITION_LOTS:
             order = self._place_passive_ask(quote, book, ledger, obi)
             if order is not None:
                 self._working_order = order
@@ -232,6 +253,9 @@ class OrderBookImbalanceHFT:
             return result
 
         return result
+
+    def _allows_new_entries(self) -> bool:
+        return True
 
     def _session_ok(self, ctx: StrategyContext) -> bool:
         if ctx.event_tag in HIGH_IMPACT_MACRO_TAGS:
@@ -253,9 +277,9 @@ class OrderBookImbalanceHFT:
 
     def _still_quoting_favorable(self, obi: float, side: Side) -> bool:
         if side == Side.BUY:
-            return obi > self.entry_threshold * 0.5
+            return obi >= self.entry_threshold * 0.5
         if side == Side.SELL:
-            return obi < self.short_entry_threshold * 0.5
+            return obi <= self.short_entry_threshold * 0.5
         return False
 
     def _place_passive_bid(
@@ -317,12 +341,8 @@ class OrderBookImbalanceHFT:
         if order.side == Side.BUY:
             if abs(ZN_SEP26.round_price_to_tick(quote.bid) - order.limit_price) > 1e-9:
                 return None
-            if obi < self.entry_threshold:
-                return None
         elif order.side == Side.SELL:
             if abs(ZN_SEP26.round_price_to_tick(quote.ask) - order.limit_price) > 1e-9:
-                return None
-            if obi > self.short_entry_threshold:
                 return None
         else:
             return None
@@ -404,8 +424,63 @@ class OrderBookImbalanceHFT:
         )
 
 
-class VolumeAwareMarketMaking(OrderBookImbalanceHFT):
-    """Alias for strategy stack registration (volume-completion / OBI HFT)."""
+class DualRegimeOBIEngine(OrderBookImbalanceHFT):
+    """
+    OBI HFT with intraday dual-regime thresholds from ``DualRegimeSessionClock``.
+
+    SNIPER_MODE @ 0.85 (08:30–11:30 ET) and VOLUME_MODE @ 0.65 (12:00–14:00 ET).
+    Thresholds are applied per bar via ``apply_regime``; resting orders from the
+    prior regime are canceled on clock-driven shifts.
+    """
+
+    name = "dual_regime_obi"
+
+    def __init__(self, quote_size: int = 1) -> None:
+        super().__init__(
+            quote_size=quote_size,
+            entry_threshold=VOLUME_THRESHOLD,
+            flip_threshold=-VOLUME_THRESHOLD,
+            short_entry_threshold=-VOLUME_THRESHOLD,
+        )
+        self._regime_mode: OBIRegimeMode = OBIRegimeMode.OFF
+        self._working_order_regime: OBIRegimeMode | None = None
+
+    @property
+    def regime_mode(self) -> OBIRegimeMode:
+        return self._regime_mode
+
+    def apply_regime(self, snapshot: OBIRegimeSnapshot) -> None:
+        self._regime_mode = snapshot.mode
+        if snapshot.allows_new_entries:
+            self.configure_thresholds(snapshot.entry_threshold)
+
+    def _allows_new_entries(self) -> bool:
+        return self._regime_mode != OBIRegimeMode.OFF
+
+    def process_tick(
+        self,
+        quote: Quote,
+        book: OrderBookSnapshot,
+        ledger: PositionLedger,
+    ) -> ExecutionStepResult:
+        result = super().process_tick(quote, book, ledger)
+        if result.action in ("working_passive_bid", "working_passive_ask"):
+            self._working_order_regime = self._regime_mode
+        return result
+
+    def cancel_stale_resting_orders(self) -> bool:
+        had = super().cancel_stale_resting_orders()
+        self._working_order_regime = None
+        return had
+
+    def reset(self) -> None:
+        super().reset()
+        self._regime_mode = OBIRegimeMode.OFF
+        self._working_order_regime = None
+
+
+class VolumeAwareMarketMaking(DualRegimeOBIEngine):
+    """Stack registration alias — dual-regime OBI with weekly volume gate."""
 
     name = "volume_aware_mm"
 
@@ -420,4 +495,6 @@ class VolumeAwareMarketMaking(OrderBookImbalanceHFT):
     def on_tick(self, ctx: StrategyContext) -> Signal | None:
         if ctx.weekly_min_remaining > self.weekly_min_urgency_threshold:
             return None
-        return super().on_tick(ctx)
+        if not self._allows_new_entries():
+            return None
+        return OrderBookImbalanceHFT.on_tick(self, ctx)

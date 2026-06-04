@@ -33,24 +33,31 @@ class TestBacktestPnL(unittest.TestCase):
             line_net = sum(line.net_pnl_usd for line in result.pnl_lines)
             self.assertAlmostEqual(line_net, result.realized_pnl_usd, places=2)
 
-    def test_net_equals_realized_plus_mark(self) -> None:
+    def test_net_equals_gross_minus_fees(self) -> None:
         result = run_backtest(
             generate_synthetic_quotes(40),
             week=1,
             use_volume_aware_mm=False,
         )
+        self.assertEqual(result.position_end, 0)
         self.assertAlmostEqual(
             result.net_pnl_usd,
-            result.realized_pnl_usd + result.mark_pnl_usd,
+            result.gross_pnl_usd - result.total_fees_usd,
             places=2,
         )
 
     def test_vamm_net_pnl_curve(self) -> None:
         result = run_backtest(generate_synthetic_quotes(60), week=1)
+        self.assertEqual(result.position_end, 0)
         self.assertEqual(len(result.net_pnl_curve), 60)
         self.assertAlmostEqual(
             result.net_pnl_curve[-1].cumulative_net_pnl_usd,
             result.net_pnl_usd,
+            places=2,
+        )
+        self.assertAlmostEqual(
+            result.net_pnl_usd,
+            result.gross_pnl_usd - result.total_fees_usd,
             places=2,
         )
 

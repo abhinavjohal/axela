@@ -1,5 +1,7 @@
 """
 Strategy stack with regime state machine and execution-layer order purge.
+
+Dual-regime OBI transition helper re-exported from ``obi_regime``.
 """
 
 from __future__ import annotations
@@ -9,6 +11,13 @@ from dataclasses import dataclass
 from enum import Enum
 
 from zn_competition.execution import ExecutionEngine, StrategyRegime, PurgeReport
+from zn_competition.strategies.obi_regime import (
+    DualRegimeSessionClock,
+    OBIRegimeMode,
+    OBIRegimeSnapshot,
+    SNIPER_THRESHOLD,
+    VOLUME_THRESHOLD,
+)
 from zn_competition.microstructure import Quote
 from zn_competition.risk import PositionLedger
 from zn_competition.strategies.base import Signal, Strategy, StrategyContext
@@ -30,6 +39,34 @@ class StrategyState(str, Enum):
     TREND_FOLLOWING = "trend_following"
     MEAN_REVERSION = "mean_reversion"
     IDLE = "idle"
+
+
+def handle_dual_regime_transition(
+    engine: object,
+    snapshot: OBIRegimeSnapshot,
+    clock: DualRegimeSessionClock,
+) -> tuple[bool, bool]:
+    """
+    Apply session regime to the OBI engine.
+
+    Returns ``(regime_changed, stale_orders_canceled)``.
+    On shift, cancels resting orders tied to the previous threshold.
+    """
+    regime_changed = clock.regime_changed(snapshot)
+    stale_canceled = False
+    if regime_changed and hasattr(engine, "cancel_stale_resting_orders"):
+        stale_canceled = bool(engine.cancel_stale_resting_orders())
+        logger.info(
+            "OBI_REGIME_SHIFT -> %s (threshold=%.2f, stale_canceled=%s)",
+            snapshot.mode.value,
+            snapshot.entry_threshold,
+            stale_canceled,
+        )
+    if hasattr(engine, "apply_regime"):
+        engine.apply_regime(snapshot)
+    elif hasattr(engine, "configure_thresholds") and snapshot.allows_new_entries:
+        engine.configure_thresholds(snapshot.entry_threshold)
+    return regime_changed, stale_canceled
 
 
 def regime_for_strategy(strategy_name: str) -> StrategyRegime:

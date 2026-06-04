@@ -3,6 +3,9 @@ OBI entry-threshold sweep on 1-minute historical CSV.
 
 Loops activation thresholds from 0.50 to 0.85 (step 0.05) and prints per-run
 P&L summary so you can find the net-profitable sweet spot after $0.50/side fees.
+
+P&L identity enforced each row: Net P&L = Gross P&L − Commission.
+All runs flatten open inventory at EOF and before weekend gaps.
 """
 
 from __future__ import annotations
@@ -37,6 +40,7 @@ def run_obi_sweep(csv_path: Path | str | None = None) -> None:
     quotes = load_zn_min_csv(path)
 
     print(f"OBI threshold sweep — {len(quotes)} bars from {path}")
+    print("(EOF + Friday/weekend flatten enabled; net = gross − commission)")
     print()
     print(
         f"{'OBI Threshold':>14}  {'Total Lots':>10}  {'Gross P&L':>12}  "
@@ -49,10 +53,20 @@ def run_obi_sweep(csv_path: Path | str | None = None) -> None:
 
     for threshold in iter_obi_thresholds():
         result = run_backtest(quotes=quotes, obi_entry_threshold=threshold)
+        result.verify_fee_schedule()
+        result.verify_net_pnl_identity()
+
         lots = result.leg_lots_traded
         gross = result.gross_pnl_usd
-        fees = lots * FEE_PER_LOT_PER_SIDE_USD
+        fees = result.total_fees_usd
         net = result.net_pnl_usd
+
+        assert abs(net - (gross - fees)) < 0.02, (
+            f"threshold {threshold}: net {net} != gross {gross} - fees {fees}"
+        )
+        assert result.position_end == 0, (
+            f"threshold {threshold}: open position {result.position_end} at EOF"
+        )
 
         print(
             f"{threshold:>14.2f}  {lots:>10}  "

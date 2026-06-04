@@ -172,9 +172,10 @@ def row_to_level1_dict(row: Mapping[str, str]) -> dict[str, float | int | str]:
         tick = TICK_SIZE_FLOAT
         close_to_low_ticks = max(0.0, (anchor - bar_low) / tick)
         close_to_high_ticks = max(0.0, (bar_high - anchor) / tick)
-        base_qty = 25
-        direct_bid_qty = max(1, int(base_qty + close_to_low_ticks * 15))
-        direct_ask_qty = max(1, int(base_qty + close_to_high_ticks * 15))
+        base_qty = 20
+        skew = 30
+        direct_bid_qty = max(1, int(base_qty + close_to_low_ticks * skew))
+        direct_ask_qty = max(1, int(base_qty + close_to_high_ticks * skew))
     else:
         direct_bid_qty = max(1, _parse_int(bid_qty_raw, 10))
         direct_ask_qty = max(1, _parse_int(ask_qty_raw, 10))

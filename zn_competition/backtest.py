@@ -12,7 +12,7 @@ from __future__ import annotations
 import csv
 import json
 from dataclasses import asdict, dataclass, field
-
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from zn_competition.economics import FeeAccounting, analyze_week_plan
@@ -29,11 +29,15 @@ from zn_competition.risk import FillRecord, PositionLedger, RiskState
 from zn_competition.specs import (
     FEE_PER_LOT_PER_SIDE_USD,
     FEE_PER_LOT_ROUND_TURN_USD,
+    ZN_SEP26,
     weekly_volume_requirement,
 )
-from zn_competition.strategies.base import StrategyContext
+from zn_competition.strategies.base import Side, StrategyContext
 from zn_competition.strategies.engine import StrategyStack
+from zn_competition.strategies.engine import handle_dual_regime_transition
+from zn_competition.strategies.obi_regime import DualRegimeSessionClock, OBIRegimeMode
 from zn_competition.strategies.volume_aware_mm import (
+    DualRegimeOBIEngine,
     OrderBookImbalanceHFT,
     VolumeAwareMarketMaking,
 )
@@ -111,6 +115,7 @@ class BacktestResult:
     pnl_lines: tuple[FillPnLLine, ...] = field(default_factory=tuple)
     net_pnl_curve: tuple[NetPnLPoint, ...] = field(default_factory=tuple)
     actions_by_engine: dict[str, int] = field(default_factory=dict)
+    dual_regime_stats: dict[str, int] = field(default_factory=dict)
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2)
@@ -125,18 +130,30 @@ class BacktestResult:
             )
 
     def verify_net_pnl_identity(self) -> None:
-        """Net = realized (per-fill net sum) + open-position mark."""
-        expected = self.realized_pnl_usd + self.mark_pnl_usd
-        if abs(self.net_pnl_usd - expected) > 0.015:
+        """Net = gross price P&L minus commissions; flat at end of run."""
+        expected_net = self.gross_pnl_usd - self.total_fees_usd
+        if abs(self.net_pnl_usd - expected_net) > 0.015:
             raise ValueError(
-                f"net mismatch: net={self.net_pnl_usd} expected={expected}"
+                f"net mismatch: net={self.net_pnl_usd} "
+                f"expected gross-fees={expected_net}"
+            )
+        if self.position_end != 0:
+            raise ValueError(
+                f"position_end must be 0 after mandatory flatten, "
+                f"got {self.position_end}"
             )
         if self.pnl_lines:
-            line_sum = sum(line.net_pnl_usd for line in self.pnl_lines)
-            if abs(line_sum - self.realized_pnl_usd) > 0.01:
+            line_gross = sum(line.gross_pnl_usd for line in self.pnl_lines)
+            if abs(line_gross - self.gross_pnl_usd) > 0.01:
+                raise ValueError(
+                    f"gross mismatch: result={self.gross_pnl_usd} "
+                    f"lines={line_gross}"
+                )
+            line_net = sum(line.net_pnl_usd for line in self.pnl_lines)
+            if abs(line_net - self.realized_pnl_usd) > 0.01:
                 raise ValueError(
                     f"realized mismatch: ledger={self.realized_pnl_usd} "
-                    f"lines={line_sum}"
+                    f"lines={line_net}"
                 )
 
 
@@ -335,6 +352,83 @@ def _record_vamm_fills(
     return fill_index, cumulative
 
 
+# CME Globex ZN weekly halt: Friday ~16:00 CT → 21:00 UTC (CDT). Flatten from 20:00 UTC.
+FRIDAY_FLATTEN_HOUR_UTC = 20
+WEEKEND_GAP_HOURS = 4.0
+
+
+def _parse_quote_timestamp(timestamp: str) -> datetime:
+    text = timestamp.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    return datetime.fromisoformat(text)
+
+
+def _is_friday_session_close_approach(timestamp: str) -> bool:
+    """True on Friday at/after 20:00 UTC (~3 PM CT) ahead of the weekend halt."""
+    dt = _parse_quote_timestamp(timestamp)
+    return dt.weekday() == 4 and dt.hour >= FRIDAY_FLATTEN_HOUR_UTC
+
+
+def _is_pre_weekend_gap(current: Quote, next_quote: Quote | None) -> bool:
+    """True when the next bar crosses a multi-hour weekend/holiday session gap."""
+    if next_quote is None:
+        return False
+    dt0 = _parse_quote_timestamp(current.timestamp)
+    dt1 = _parse_quote_timestamp(next_quote.timestamp)
+    gap = dt1 - dt0
+    if gap < timedelta(hours=WEEKEND_GAP_HOURS):
+        return False
+    if dt0.weekday() >= 4:
+        return True
+    if dt1.weekday() in (6, 0) and gap >= timedelta(hours=24):
+        return True
+    return False
+
+
+def _flatten_at_market(
+    ledger: PositionLedger,
+    quote: Quote,
+    reason: str,
+) -> FillRecord | None:
+    """Aggressive flatten at inside market (sell @ bid / buy @ ask)."""
+    if ledger.position == 0:
+        return None
+    lots = abs(ledger.position)
+    if ledger.position > 0:
+        side = Side.SELL
+        price = ZN_SEP26.round_price_to_tick(quote.bid)
+    else:
+        side = Side.BUY
+        price = ZN_SEP26.round_price_to_tick(quote.ask)
+    return FillRecord(
+        side=side,
+        lots=lots,
+        price=price,
+        fee_usd=lots * FEE_PER_LOT_PER_SIDE_USD,
+        timestamp=quote.timestamp,
+        reason=reason,
+    )
+
+
+def _apply_mandatory_flatten(
+    ledger: PositionLedger,
+    quote: Quote,
+    reason: str,
+    fill_index: int,
+    pnl_lines: list[FillPnLLine],
+    vamm: OrderBookImbalanceHFT | None,
+) -> int:
+    """Flatten open inventory and record P&L; reset OBI engine state."""
+    fill = _flatten_at_market(ledger, quote, reason)
+    if fill is None:
+        return fill_index
+    if vamm is not None:
+        vamm.reset()
+    _apply_fill_and_record_pnl(ledger, fill, fill_index, pnl_lines)
+    return fill_index + 1
+
+
 def run_backtest(
     quotes: list[Quote] | None = None,
     week: int = 1,
@@ -344,6 +438,7 @@ def run_backtest(
     csv_path: Path | str | None = None,
     use_volume_aware_mm: bool = True,
     obi_entry_threshold: float | None = None,
+    use_dual_regime: bool | None = None,
 ) -> BacktestResult:
     if week < 1 or week > 4:
         raise ValueError(f"week must be 1–4, got {week}")
@@ -361,6 +456,19 @@ def run_backtest(
     pnl_lines: list[FillPnLLine] = []
     net_pnl_curve: list[NetPnLPoint] = []
     fill_index = 0
+    dual_regime = (
+        use_dual_regime
+        if use_dual_regime is not None
+        else (obi_entry_threshold is None and use_volume_aware_mm)
+    )
+    regime_clock = DualRegimeSessionClock() if dual_regime else None
+    regime_stats: dict[str, int] = {
+        "sniper_bars": 0,
+        "volume_bars": 0,
+        "off_bars": 0,
+        "regime_shifts": 0,
+        "stale_order_cancels": 0,
+    }
 
     if use_volume_aware_mm:
         if obi_entry_threshold is not None:
@@ -369,6 +477,8 @@ def run_backtest(
                 flip_threshold=-obi_entry_threshold,
                 short_entry_threshold=-obi_entry_threshold,
             )
+        elif dual_regime:
+            vamm = DualRegimeOBIEngine()
         else:
             vamm = VolumeAwareMarketMaking()
     else:
@@ -377,6 +487,17 @@ def run_backtest(
     for idx, quote in enumerate(quotes):
         if risk.halted:
             break
+
+        is_last_bar = idx == len(quotes) - 1
+        next_quote = quotes[idx + 1] if not is_last_bar else None
+        friday_flatten = _is_friday_session_close_approach(quote.timestamp)
+        pre_weekend_gap = _is_pre_weekend_gap(quote, next_quote)
+        risk_flatten = friday_flatten or pre_weekend_gap
+
+        if risk_flatten and use_volume_aware_mm:
+            vamm.reset()
+            if regime_clock is not None:
+                regime_clock.reset()
 
         features = feature_engine.update(quote)
         tag, phase, surprise = (None, None, None)
@@ -405,25 +526,45 @@ def run_backtest(
         )
 
         if use_volume_aware_mm:
-            snap = _snapshot_ledger(ledger)
-            realized_before = ledger.realized_pnl_usd
-            step = vamm.process_tick(quote, book, ledger)
-            if step.fills:
-                fill_index, _ = _record_vamm_fills(
-                    snap,
-                    step.fills,
-                    fill_index,
-                    pnl_lines,
-                    realized_before,
+            if dual_regime and regime_clock is not None:
+                snapshot = regime_clock.evaluate(quote.timestamp)
+                if snapshot.mode == OBIRegimeMode.SNIPER_MODE:
+                    regime_stats["sniper_bars"] += 1
+                elif snapshot.mode == OBIRegimeMode.VOLUME_MODE:
+                    regime_stats["volume_bars"] += 1
+                else:
+                    regime_stats["off_bars"] += 1
+                shifted, stale = handle_dual_regime_transition(
+                    vamm, snapshot, regime_clock
                 )
-                risk.apply_realized(ledger.realized_pnl_usd - realized_before)
-            if step.action not in ("none", "idle"):
-                actions_by_engine[step.action] = (
-                    actions_by_engine.get(step.action, 0) + 1
-                )
-                signals_by_reason[step.action] = (
-                    signals_by_reason.get(step.action, 0) + 1
-                )
+                if shifted:
+                    regime_stats["regime_shifts"] += 1
+                if stale:
+                    regime_stats["stale_order_cancels"] += 1
+                    actions_by_engine["regime_cancel_stale"] = (
+                        actions_by_engine.get("regime_cancel_stale", 0) + 1
+                    )
+
+            if not risk_flatten:
+                snap = _snapshot_ledger(ledger)
+                realized_before = ledger.realized_pnl_usd
+                step = vamm.process_tick(quote, book, ledger)
+                if step.fills:
+                    fill_index, _ = _record_vamm_fills(
+                        snap,
+                        step.fills,
+                        fill_index,
+                        pnl_lines,
+                        realized_before,
+                    )
+                    risk.apply_realized(ledger.realized_pnl_usd - realized_before)
+                if step.action not in ("none", "idle"):
+                    actions_by_engine[step.action] = (
+                        actions_by_engine.get(step.action, 0) + 1
+                    )
+                    signals_by_reason[step.action] = (
+                        signals_by_reason.get(step.action, 0) + 1
+                    )
         else:
             from zn_competition.execution import execute_signal
 
@@ -440,8 +581,38 @@ def run_backtest(
                     fill_index += 1
                     risk.apply_realized(net_this_fill)
 
+                    risk.apply_realized(net_this_fill)
+
+        flatten_reason: str | None = None
+        if is_last_bar and ledger.position != 0:
+            flatten_reason = "eof_mandatory_flatten"
+        elif risk_flatten and ledger.position != 0:
+            if friday_flatten:
+                flatten_reason = "friday_session_close_flatten"
+            else:
+                flatten_reason = "weekend_gap_flatten"
+
+        if flatten_reason is not None:
+            realized_before = ledger.realized_pnl_usd
+            fills_before = len(ledger.fills)
+            fill_index = _apply_mandatory_flatten(
+                ledger,
+                quote,
+                flatten_reason,
+                fill_index,
+                pnl_lines,
+                vamm if use_volume_aware_mm else None,
+            )
+            if len(ledger.fills) > fills_before:
+                risk.apply_realized(ledger.realized_pnl_usd - realized_before)
+                actions_by_engine[flatten_reason] = (
+                    actions_by_engine.get(flatten_reason, 0) + 1
+                )
+
         mark = quote.mid
         mark_pnl = ledger.mark_price_pnl_usd(mark)
+        gross_so_far = sum(line.gross_pnl_usd for line in pnl_lines)
+        fees_so_far = ledger.total_fees_usd
         net_pnl_curve.append(
             NetPnLPoint(
                 timestamp=quote.timestamp,
@@ -449,16 +620,15 @@ def run_backtest(
                 position=ledger.position,
                 realized_pnl_usd=round(ledger.realized_pnl_usd, 4),
                 mark_pnl_usd=round(mark_pnl, 4),
-                cumulative_net_pnl_usd=round(
-                    ledger.realized_pnl_usd + mark_pnl, 4
-                ),
-                fees_paid_usd=round(ledger.total_fees_usd, 4),
+                cumulative_net_pnl_usd=round(gross_so_far - fees_so_far, 4),
+                fees_paid_usd=round(fees_so_far, 4),
             )
         )
 
+    gross_pnl_usd = round(sum(line.gross_pnl_usd for line in pnl_lines), 2)
+    total_fees_usd = round(ledger.total_fees_usd, 2)
+    net_total = round(gross_pnl_usd - total_fees_usd, 2)
     mark_pnl = ledger.mark_price_pnl_usd(quotes[-1].mid)
-    gross_realized = ledger.realized_pnl_usd + ledger.total_fees_usd
-    net_total = ledger.realized_pnl_usd + mark_pnl
 
     result = BacktestResult(
         week=week,
@@ -466,11 +636,11 @@ def run_backtest(
         weekly_min_legs=weekly_min,
         met_volume_min=ledger.leg_lots_traded >= weekly_min,
         position_end=ledger.position,
-        gross_pnl_usd=round(gross_realized, 2),
-        total_fees_usd=round(ledger.total_fees_usd, 2),
+        gross_pnl_usd=gross_pnl_usd,
+        total_fees_usd=total_fees_usd,
         realized_pnl_usd=round(ledger.realized_pnl_usd, 2),
         mark_pnl_usd=round(mark_pnl, 2),
-        net_pnl_usd=round(net_total, 2),
+        net_pnl_usd=net_total,
         fill_count=len(ledger.fills),
         halted=risk.halted,
         halt_reason=risk.halt_reason,
@@ -478,10 +648,32 @@ def run_backtest(
         pnl_lines=tuple(pnl_lines),
         net_pnl_curve=tuple(net_pnl_curve),
         actions_by_engine=actions_by_engine,
+        dual_regime_stats=regime_stats if dual_regime else {},
     )
     result.verify_fee_schedule()
     result.verify_net_pnl_identity()
     return result
+
+
+def print_dual_regime_summary(result: BacktestResult) -> None:
+    """Console summary for dual-regime OBI backtest runs."""
+    print("=" * 56)
+    print("  Dual-Regime OBI Backtest Summary")
+    print("=" * 56)
+    print(f"  Total Lots Traded:     {result.leg_lots_traded}")
+    print(f"  Gross P&L (USD):       ${result.gross_pnl_usd:,.2f}")
+    print(f"  Total Commission:      ${result.total_fees_usd:,.2f}")
+    print(f"  Net P&L (USD):         ${result.net_pnl_usd:,.2f}")
+    print(f"  Position at EOF:       {result.position_end}")
+    if result.dual_regime_stats:
+        stats = result.dual_regime_stats
+        print("-" * 56)
+        print(f"  Sniper window bars:    {stats.get('sniper_bars', 0)}")
+        print(f"  Volume window bars:    {stats.get('volume_bars', 0)}")
+        print(f"  Off-session bars:      {stats.get('off_bars', 0)}")
+        print(f"  Regime shifts:         {stats.get('regime_shifts', 0)}")
+        print(f"  Stale order cancels:   {stats.get('stale_order_cancels', 0)}")
+    print("=" * 56)
 
 
 def run_backtest_csv(path: Path, week: int = 1) -> BacktestResult:
@@ -530,7 +722,9 @@ if __name__ == "__main__":
             week=int(sys.argv[2]) if len(sys.argv) > 2 else 1,
         )
     else:
-        result = run_backtest(week=1)
+        result = run_backtest(week=1, use_dual_regime=True)
+    print_dual_regime_summary(result)
+    print()
     print(result.to_json())
     plan = analyze_week_plan(1, result.leg_lots_traded)
     print("week_plan:", plan)

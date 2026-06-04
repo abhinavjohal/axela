@@ -7,6 +7,7 @@ Volume targets (competition legs): Week1 200, W2 300, W3 400, W4 500 (2,000 tota
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 
 from zn_competition.economics import net_pnl_from_tick_move
 from zn_competition.microstructure import OrderBookSnapshot, Quote
@@ -15,9 +16,11 @@ from zn_competition.risk import (
     OrderRequest,
     PositionLedger,
     clip_order_size,
+    get_current_position,
     validate_order,
 )
 from zn_competition.specs import (
+    CT,
     FEE_PER_LOT_PER_SIDE_USD,
     HIGH_IMPACT_MACRO_TAGS,
     TICK_SIZE_FLOAT,
@@ -50,6 +53,19 @@ class ChurnQuotePair:
     ask: ChurnLimitOrder
 
 
+MAX_CHURN_SPREAD_TICKS = 2.0
+CHURN_LOT_SIZE = 1
+# Module 4 — TT Generator Block TimeInterval (30 seconds)
+CHURN_GENERATOR_PERIOD_MS = 30_000
+
+
+def _timestamp_to_epoch_ms(timestamp: str) -> int:
+    dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=CT)
+    return int(dt.timestamp() * 1000)
+
+
 @dataclass
 class ChurnStepResult:
     fills: list[FillRecord] = field(default_factory=list)
@@ -59,25 +75,33 @@ class ChurnStepResult:
     quota_satisfied: bool = False
     active: bool = False
     action: str = "idle"
+    pulse_fired: bool = False
+    execution_token_active: bool = False
 
 
 @dataclass
 class VolumeChurner:
     """
-    Secondary volume sleeve — only when net directional risk is zero (flat).
+    Module 4 volume sleeve — TT Generator Block @ ``pulse_period_ms`` (default 30s).
 
-    Posts offsetting 1-lot limits on the inside bid and inside ask, counts every
-    executed leg (entries and exits), and disables once the weekly lot quota is met.
+    On each generator pulse:
+      1. Read net position from ``risk.get_current_position(ledger)``
+      2. ADL gate: if ``current_position != 0`` → drop execution token (no quotes)
+      3. If ``current_position == 0`` → arm two simultaneous 1-lot passive limits
+         at inside direct bid and inside direct ask
     """
 
     name: str = "volume_churner"
     churn_lots: int = CHURN_LOT_SIZE
     max_spread_ticks: float = MAX_CHURN_SPREAD_TICKS
+    pulse_period_ms: int = CHURN_GENERATOR_PERIOD_MS
 
     _bid_working: ChurnLimitOrder | None = field(default=None, init=False, repr=False)
     _ask_working: ChurnLimitOrder | None = field(default=None, init=False, repr=False)
     _enabled: bool = field(default=True, init=False, repr=False)
     _session_legs_executed: int = field(default=0, init=False, repr=False)
+    _last_pulse_ms: int | None = field(default=None, init=False, repr=False)
+    _execution_token_active: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.churn_lots < 1 or self.churn_lots > ZN_SEP26.max_position_lots:
@@ -90,6 +114,33 @@ class VolumeChurner:
         self._ask_working = None
         self._enabled = True
         self._session_legs_executed = 0
+        self._last_pulse_ms = None
+        self._execution_token_active = False
+
+    def _pulse_due(self, timestamp_ms: int) -> bool:
+        if self._last_pulse_ms is None:
+            return True
+        return timestamp_ms - self._last_pulse_ms >= self.pulse_period_ms
+
+    def _drop_execution_token(self) -> None:
+        """ADL: abort churn arm — clear working quotes, do not route inventory."""
+        self._bid_working = None
+        self._ask_working = None
+        self._execution_token_active = False
+
+    def _arm_simultaneous_inside_quotes(
+        self,
+        book: OrderBookSnapshot,
+        timestamp: str,
+    ) -> ChurnQuotePair:
+        """Two passive 1-lot limits @ inside direct bid and inside direct ask."""
+        pair = self.place_offsetting_inside_quotes(
+            book, timestamp, self.churn_lots
+        )
+        self._bid_working = pair.bid
+        self._ask_working = pair.ask
+        self._execution_token_active = True
+        return pair
 
     @property
     def legs_executed(self) -> int:
@@ -194,7 +245,7 @@ class VolumeChurner:
             max_hold_seconds=5,
         )
 
-    def process_tick(
+    def process_generator_pulse(
         self,
         quote: Quote,
         book: OrderBookSnapshot,
@@ -202,10 +253,10 @@ class VolumeChurner:
         ctx: StrategyContext,
     ) -> ChurnStepResult:
         """
-        Full churn execution for one quote update.
+        Module 4 execution engine — one TT Generator Block pulse.
 
-        Counts each ``FillRecord`` as leg lots toward the weekly quota (entry and exit
-        legs both count). Stops placing new quotes when the week minimum is satisfied.
+        Fires every ``pulse_period_ms`` (30_000ms). Non-pulse ticks return
+        ``action=pulse_wait`` without placing or filling orders.
         """
         required = self.weekly_requirement(ctx.week_number)
         legs_done = self._legs_traded_this_week(ctx, ledger)
@@ -214,15 +265,24 @@ class VolumeChurner:
             weekly_requirement=required,
             weekly_legs_remaining=remaining,
             legs_executed_total=self._session_legs_executed,
+            execution_token_active=self._execution_token_active,
         )
+
+        now_ms = _timestamp_to_epoch_ms(quote.timestamp)
+        if not self._pulse_due(now_ms):
+            result.action = "pulse_wait"
+            return result
+
+        self._last_pulse_ms = now_ms
+        result.pulse_fired = True
 
         if self.weekly_quota_satisfied(ctx, ledger) or self.competition_quota_satisfied(ctx):
             self._enabled = False
-            self._bid_working = None
-            self._ask_working = None
+            self._drop_execution_token()
             result.quota_satisfied = True
             result.active = False
             result.action = "quota_off"
+            result.execution_token_active = False
             return result
 
         if not self._enabled:
@@ -230,35 +290,33 @@ class VolumeChurner:
             return result
 
         if ctx.event_tag in HIGH_IMPACT_MACRO_TAGS:
+            self._drop_execution_token()
             result.action = "macro_blocked"
+            result.execution_token_active = False
             return result
 
         spread_ticks = (book.ask - book.bid) / TICK_SIZE_FLOAT
         if spread_ticks > self.max_spread_ticks:
+            self._drop_execution_token()
             result.action = "spread_blocked"
+            result.execution_token_active = False
             return result
 
-        if ledger.position != 0:
-            flatten = self._flatten_inventory(quote, book, ledger)
-            if flatten is not None:
-                result.fills.append(flatten)
-                self._record_leg(flatten.lots)
-            result.action = "flatten"
-            self._sync_quota(result, ctx, ledger)
+        current_position = get_current_position(ledger)
+
+        if current_position != 0:
+            self._drop_execution_token()
+            result.action = "token_dropped"
+            result.execution_token_active = False
             return result
 
         if not self.should_run(ctx):
             result.action = "idle"
             return result
 
-        if self._bid_working is None and self._ask_working is None:
-            pair = self.place_offsetting_inside_quotes(
-                book, quote.timestamp, self.churn_lots
-            )
-            self._bid_working = pair.bid
-            self._ask_working = pair.ask
-            result.action = "quotes_placed"
-            result.active = True
+        self._arm_simultaneous_inside_quotes(book, quote.timestamp)
+        result.action = "quotes_armed"
+        result.execution_token_active = True
 
         bid_fill = self._try_fill_churn_order(
             self._bid_working, quote, book, ledger, Side.BUY
@@ -276,23 +334,36 @@ class VolumeChurner:
             self._record_leg(ask_fill.lots)
             self._ask_working = None
 
-        if ledger.position != 0:
-            flatten = self._flatten_inventory(quote, book, ledger)
-            if flatten is not None:
-                result.fills.append(flatten)
-                self._record_leg(flatten.lots)
-                result.action = "churn_cycle_flatten"
+        post_position = get_current_position(ledger)
+        if post_position != 0:
+            self._drop_execution_token()
+            result.action = "token_dropped_post_fill"
+            result.execution_token_active = False
         elif bid_fill and ask_fill:
             result.action = "churn_cycle_complete"
+            self._execution_token_active = False
         elif bid_fill or ask_fill:
             result.action = "churn_partial_fill"
+            self._drop_execution_token()
+            result.execution_token_active = False
         else:
             result.action = "quotes_working"
 
         result.active = self._enabled and not self.weekly_quota_satisfied(ctx, ledger)
         self._sync_quota(result, ctx, ledger)
         result.legs_executed_total = self._session_legs_executed
+        result.execution_token_active = self._execution_token_active
         return result
+
+    def process_tick(
+        self,
+        quote: Quote,
+        book: OrderBookSnapshot,
+        ledger: PositionLedger,
+        ctx: StrategyContext,
+    ) -> ChurnStepResult:
+        """Alias for ``process_generator_pulse`` (Module 4 generator engine)."""
+        return self.process_generator_pulse(quote, book, ledger, ctx)
 
     def _record_leg(self, lots: int) -> None:
         self._session_legs_executed += lots
@@ -350,43 +421,18 @@ class VolumeChurner:
         ledger.apply_fill(fill)
         return fill
 
-    def _flatten_inventory(
-        self,
-        quote: Quote,
-        book: OrderBookSnapshot,
-        ledger: PositionLedger,
-    ) -> FillRecord | None:
-        """Exit any churn inventory at the inside market (scratch to flat)."""
-        pos = ledger.position
-        if pos == 0:
-            return None
-
-        if pos > 0:
-            side = Side.SELL
-            price = book.inside_ask
-            lots = min(abs(pos), self.churn_lots)
-            validate_order(pos, OrderRequest(Side.SELL, lots, "volume_churn_flatten"))
-        else:
-            side = Side.BUY
-            price = book.inside_bid
-            lots = min(abs(pos), self.churn_lots)
-            validate_order(pos, OrderRequest(Side.BUY, lots, "volume_churn_flatten"))
-
-        fill = FillRecord(
-            side=side,
-            lots=lots,
-            price=price,
-            fee_usd=lots * FEE_PER_LOT_PER_SIDE_USD,
-            timestamp=quote.timestamp,
-            reason="volume_churn_flatten",
-        )
-        ledger.apply_fill(fill)
-        return fill
-
     def expected_scratch_cost_usd(self, lots: int | None = None) -> float:
         """Round-turn fee drag for a completed churn cycle at zero tick move."""
         n = lots if lots is not None else self.churn_lots
         return net_pnl_from_tick_move(0.0, n, sides=2).net_pnl_usd
+
+
+class VolumeChurnerExecutionEngine(VolumeChurner):
+    """
+    Module 4 competition volume engine — TT Generator Block @ 30s default.
+
+    Thin alias over ``VolumeChurner`` with explicit ``process_generator_pulse`` entry.
+    """
 
 
 class SessionMeanReversionStrategy:
@@ -422,6 +468,18 @@ class SessionMeanReversionStrategy:
             return self.volume_churner.on_tick(ctx)
         return None
 
+    def process_churn_pulse(
+        self,
+        quote: Quote,
+        book: OrderBookSnapshot,
+        ledger: PositionLedger,
+        ctx: StrategyContext,
+    ) -> ChurnStepResult | None:
+        """Run Module 4 generator pulse (always — drops token when not flat)."""
+        if not self.enable_volume_churn:
+            return None
+        return self.volume_churner.process_generator_pulse(quote, book, ledger, ctx)
+
     def process_churn_tick(
         self,
         quote: Quote,
@@ -429,12 +487,8 @@ class SessionMeanReversionStrategy:
         ledger: PositionLedger,
         ctx: StrategyContext,
     ) -> ChurnStepResult | None:
-        """Run volume churner when flat and MR has no position on."""
-        if not self.enable_volume_churn:
-            return None
-        if ctx.position != 0:
-            return None
-        return self.volume_churner.process_tick(quote, book, ledger, ctx)
+        """Backward-compatible alias for ``process_churn_pulse``."""
+        return self.process_churn_pulse(quote, book, ledger, ctx)
 
     def _mean_reversion_signal(self, ctx: StrategyContext) -> Signal | None:
         if ctx.event_tag in HIGH_IMPACT_MACRO_TAGS:

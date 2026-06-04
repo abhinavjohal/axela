@@ -218,12 +218,11 @@ class HistoricalSimulator:
         _assert_ledger_position_cap(self.ledger)
         ctx = _build_context(quote, features, self.ledger, self.week, self.weekly_min)
 
-        if self.ledger.position == 0:
-            churn = self.session_mr.process_churn_tick(
-                quote, book, self.ledger, ctx
-            )
-            if churn is not None and churn.action not in ("idle", "none"):
-                self._record_action(f"churn:{churn.action}")
+        churn = self.session_mr.process_churn_pulse(
+            quote, book, self.ledger, ctx
+        )
+        if churn is not None and churn.action not in ("idle", "none", "pulse_wait"):
+            self._record_action(f"churn:{churn.action}")
 
         _assert_ledger_position_cap(self.ledger)
 

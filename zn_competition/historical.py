@@ -4,18 +4,239 @@ Historical simulation loop — mock order book feed through all strategy modules
 
 from __future__ import annotations
 
+import csv
 from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Mapping
 
 from zn_competition.execution import ExecutionEngine, ExecutionRiskException
 from zn_competition.features import MicrostructureFeatureEngine
-from zn_competition.microstructure import Quote, order_book_from_quote
+from zn_competition.microstructure import (
+    Level1MarketRow,
+    Quote,
+    order_book_from_quote,
+    quote_from_level1,
+)
 from zn_competition.risk import ExecutionException, PositionLedger, RiskState
 from zn_competition.specs import (
     FEE_PER_LOT_PER_SIDE_USD,
     MAX_POSITION_LOTS,
     TICK_SIZE_FLOAT,
+    ZN_SEP26,
     weekly_volume_requirement,
 )
+
+DEFAULT_ZN_MIN_DATA_PATH = Path(__file__).resolve().parent / "data" / "zn_min_data.csv"
+
+_TIMESTAMP_ALIASES = (
+    "timestamp",
+    "Timestamp (UTC)",
+    "time",
+    "datetime",
+    "DateTime",
+    "date",
+    "Date",
+)
+_DIRECT_BID_PRICE_ALIASES = (
+    "direct_bid_price",
+    "bid",
+    "Bid",
+    "bid_price",
+    "BidPrice",
+    "best_bid",
+)
+_DIRECT_ASK_PRICE_ALIASES = (
+    "direct_ask_price",
+    "ask",
+    "Ask",
+    "ask_price",
+    "AskPrice",
+    "best_ask",
+)
+_DIRECT_BID_QTY_ALIASES = (
+    "direct_bid_qty",
+    "bid_qty",
+    "BidQty",
+    "bid_size",
+    "BidSize",
+    "bid_quantity",
+)
+_DIRECT_ASK_QTY_ALIASES = (
+    "direct_ask_qty",
+    "ask_qty",
+    "AskQty",
+    "ask_size",
+    "AskSize",
+    "ask_quantity",
+)
+_BID_ORDER_COUNT_ALIASES = (
+    "bid_order_count",
+    "bid_orders",
+    "BidOrders",
+    "bid_count",
+)
+_ASK_ORDER_COUNT_ALIASES = (
+    "ask_order_count",
+    "ask_orders",
+    "AskOrders",
+    "ask_count",
+)
+_OHLC_CLOSE_ALIASES = ("Close", "close", "last", "Last")
+_OHLC_HIGH_ALIASES = ("High", "high")
+_OHLC_LOW_ALIASES = ("Low", "low")
+_OHLC_OPEN_ALIASES = ("Open", "open")
+
+
+def _cell(row: Mapping[str, str], *aliases: str) -> str:
+    """Return first non-empty cell matching any alias (case-insensitive)."""
+    normalized = {k.strip().lower(): v.strip() for k, v in row.items() if v is not None}
+    for alias in aliases:
+        key = alias.strip().lower()
+        if key in normalized and normalized[key]:
+            return normalized[key]
+    return ""
+
+
+def _parse_float(value: str, default: float = 0.0) -> float:
+    if not value:
+        return default
+    return float(value.replace(",", ""))
+
+
+def _parse_int(value: str, default: int = 0) -> int:
+    if not value:
+        return default
+    return int(float(value.replace(",", "")))
+
+
+def _normalize_timestamp(raw: str) -> str:
+    text = raw.strip()
+    if not text:
+        return text
+    if "T" in text:
+        return text if "+" in text or text.endswith("Z") else f"{text}+00:00"
+    return text.replace(" ", "T") + "+00:00"
+
+
+def row_to_level1_dict(row: Mapping[str, str]) -> dict[str, float | int | str]:
+    """
+    Map one CSV row to internal Level 1 fields.
+
+    Supports explicit L1 columns or OHLC-only bars (derives inside market and
+    qty proxies from bar geometry for OBI simulation).
+    """
+    timestamp = _normalize_timestamp(_cell(row, *_TIMESTAMP_ALIASES))
+    if not timestamp:
+        raise ValueError("CSV row missing timestamp column")
+
+    bid_price_raw = _cell(row, *_DIRECT_BID_PRICE_ALIASES)
+    ask_price_raw = _cell(row, *_DIRECT_ASK_PRICE_ALIASES)
+    bid_qty_raw = _cell(row, *_DIRECT_BID_QTY_ALIASES)
+    ask_qty_raw = _cell(row, *_DIRECT_ASK_QTY_ALIASES)
+    bid_count_raw = _cell(row, *_BID_ORDER_COUNT_ALIASES)
+    ask_count_raw = _cell(row, *_ASK_ORDER_COUNT_ALIASES)
+
+    close = _parse_float(_cell(row, *_OHLC_CLOSE_ALIASES))
+    high = _parse_float(_cell(row, *_OHLC_HIGH_ALIASES), close)
+    low = _parse_float(_cell(row, *_OHLC_LOW_ALIASES), close)
+    open_ = _parse_float(_cell(row, *_OHLC_OPEN_ALIASES), close)
+
+    if close:
+        anchor = close
+    elif high and low:
+        anchor = (high + low) / 2.0
+    else:
+        anchor = open_
+
+    bar_high = max(high, anchor, low) if anchor else high
+    bar_low = min(low, anchor, high) if anchor else low
+
+    if bid_price_raw and ask_price_raw:
+        direct_bid_price = ZN_SEP26.round_price_to_tick(_parse_float(bid_price_raw))
+        direct_ask_price = ZN_SEP26.round_price_to_tick(_parse_float(ask_price_raw))
+    elif anchor:
+        half_spread = max((bar_high - bar_low) / 2.0, TICK_SIZE_FLOAT / 2.0)
+        direct_bid_price = ZN_SEP26.round_price_to_tick(anchor - half_spread)
+        direct_ask_price = ZN_SEP26.round_price_to_tick(anchor + half_spread)
+        if direct_ask_price <= direct_bid_price:
+            direct_ask_price = ZN_SEP26.round_price_to_tick(
+                direct_bid_price + TICK_SIZE_FLOAT
+            )
+    else:
+        raise ValueError(f"Row {timestamp!r}: no bid/ask or OHLC price columns")
+
+    if bid_qty_raw and ask_qty_raw:
+        direct_bid_qty = max(1, _parse_int(bid_qty_raw, 1))
+        direct_ask_qty = max(1, _parse_int(ask_qty_raw, 1))
+    elif anchor:
+        tick = TICK_SIZE_FLOAT
+        close_to_low_ticks = max(0.0, (anchor - bar_low) / tick)
+        close_to_high_ticks = max(0.0, (bar_high - anchor) / tick)
+        base_qty = 25
+        direct_bid_qty = max(1, int(base_qty + close_to_low_ticks * 15))
+        direct_ask_qty = max(1, int(base_qty + close_to_high_ticks * 15))
+    else:
+        direct_bid_qty = max(1, _parse_int(bid_qty_raw, 10))
+        direct_ask_qty = max(1, _parse_int(ask_qty_raw, 10))
+
+    bid_order_count = max(1, _parse_int(bid_count_raw, max(1, direct_bid_qty // 10)))
+    ask_order_count = max(1, _parse_int(ask_count_raw, max(1, direct_ask_qty // 10)))
+
+    return {
+        "timestamp": timestamp,
+        "direct_bid_price": direct_bid_price,
+        "direct_ask_price": direct_ask_price,
+        "direct_bid_qty": direct_bid_qty,
+        "direct_ask_qty": direct_ask_qty,
+        "bid_order_count": bid_order_count,
+        "ask_order_count": ask_order_count,
+    }
+
+
+def level1_dict_to_quote(fields: Mapping[str, float | int | str]) -> Quote:
+    return quote_from_level1(
+        Level1MarketRow(
+            timestamp=str(fields["timestamp"]),
+            direct_bid_price=float(fields["direct_bid_price"]),
+            direct_ask_price=float(fields["direct_ask_price"]),
+            direct_bid_qty=int(fields["direct_bid_qty"]),
+            direct_ask_qty=int(fields["direct_ask_qty"]),
+            bid_order_count=int(fields["bid_order_count"]),
+            ask_order_count=int(fields["ask_order_count"]),
+        )
+    )
+
+
+def load_zn_min_csv(path: Path | str | None = None) -> list[Quote]:
+    """
+    Load 1-minute ZN historical CSV chronologically into Level 1 ``Quote`` rows.
+
+    Default path: ``zn_competition/data/zn_min_data.csv``.
+    """
+    csv_path = Path(path) if path is not None else DEFAULT_ZN_MIN_DATA_PATH
+    if not csv_path.is_file():
+        raise FileNotFoundError(f"Historical CSV not found: {csv_path}")
+
+    rows: list[tuple[str, Quote]] = []
+    with csv_path.open(newline="", encoding="utf-8-sig") as handle:
+        reader = csv.DictReader(handle)
+        if reader.fieldnames is None:
+            raise ValueError(f"CSV has no header row: {csv_path}")
+        for line_no, row in enumerate(reader, start=2):
+            if not any(v and str(v).strip() for v in row.values()):
+                continue
+            try:
+                fields = row_to_level1_dict(row)
+                quote = level1_dict_to_quote(fields)
+                rows.append((str(fields["timestamp"]), quote))
+            except (ValueError, TypeError) as exc:
+                raise ValueError(f"{csv_path}:{line_no}: {exc}") from exc
+
+    if not rows:
+        raise ValueError(f"no quotes loaded from {csv_path}")
+
+    rows.sort(key=lambda item: item[0])
+    return [quote for _, quote in rows]
 from zn_competition.strategies.base import StrategyContext
 from zn_competition.strategies.engine import StrategyStack
 from zn_competition.strategies.macro_event import MacroEventStrategy
@@ -261,8 +482,14 @@ class HistoricalSimulator:
 def run_historical_loop(
     quotes: list[Quote] | None = None,
     week: int = 1,
+    csv_path: Path | str | None = None,
 ) -> HistoricalSummary:
-    stream = quotes if quotes is not None else generate_mock_order_book_stream()
+    if quotes is not None:
+        stream = quotes
+    elif csv_path is not None or DEFAULT_ZN_MIN_DATA_PATH.is_file():
+        stream = load_zn_min_csv(csv_path)
+    else:
+        stream = generate_mock_order_book_stream()
     return HistoricalSimulator(week=week).run(stream)
 
 

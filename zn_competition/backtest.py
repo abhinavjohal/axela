@@ -16,8 +16,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from zn_competition.economics import FeeAccounting, analyze_week_plan
-from zn_competition.execution import execute_signal
 from zn_competition.features import MicrostructureFeatureEngine
+from zn_competition.historical import DEFAULT_ZN_MIN_DATA_PATH, load_zn_min_csv
 from zn_competition.microstructure import (
     Level1MarketRow,
     Quote,
@@ -33,6 +33,7 @@ from zn_competition.specs import (
 )
 from zn_competition.strategies.base import StrategyContext
 from zn_competition.strategies.engine import StrategyStack
+from zn_competition.strategies.volume_aware_mm import VolumeAwareMarketMaking
 
 REQUIRED_PRICE_COLUMNS_ANY = (
     frozenset({"bid", "ask"}),
@@ -56,6 +57,19 @@ OPTIONAL_COLUMNS = frozenset(
         "surprise_10y_equiv_bp",
     }
 )
+
+
+@dataclass(frozen=True)
+class NetPnLPoint:
+    """Chronological mark-to-market net P&L after each bar (realized + open mark)."""
+
+    timestamp: str
+    bar_index: int
+    position: int
+    realized_pnl_usd: float
+    mark_pnl_usd: float
+    cumulative_net_pnl_usd: float
+    fees_paid_usd: float
 
 
 @dataclass(frozen=True)
@@ -92,6 +106,8 @@ class BacktestResult:
     halt_reason: str
     signals_by_reason: dict[str, int]
     pnl_lines: tuple[FillPnLLine, ...] = field(default_factory=tuple)
+    net_pnl_curve: tuple[NetPnLPoint, ...] = field(default_factory=tuple)
+    actions_by_engine: dict[str, int] = field(default_factory=dict)
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2)
@@ -247,6 +263,7 @@ def _record_fill_pnl(
     net_this_fill: float,
     fee_usd: float,
     pnl_lines: list[FillPnLLine],
+    cumulative_net_pnl_usd: float | None = None,
 ) -> None:
     """Append one line-level P&L row after ``ledger.apply_fill``."""
     last = ledger.fills[-1]
@@ -263,31 +280,88 @@ def _record_fill_pnl(
             fee_usd=fee_usd,
             net_pnl_usd=net_this_fill,
             position_after=ledger.position,
-            cumulative_net_pnl_usd=ledger.realized_pnl_usd,
+            cumulative_net_pnl_usd=(
+                cumulative_net_pnl_usd
+                if cumulative_net_pnl_usd is not None
+                else ledger.realized_pnl_usd
+            ),
         )
     )
 
 
+@dataclass(frozen=True)
+class _LedgerSnapshot:
+    position: int
+    avg_entry_price: float
+
+
+def _snapshot_ledger(ledger: PositionLedger) -> _LedgerSnapshot:
+    return _LedgerSnapshot(
+        position=ledger.position,
+        avg_entry_price=ledger.avg_entry_price,
+    )
+
+
+def _record_vamm_fills(
+    snap: _LedgerSnapshot,
+    fills: list[FillRecord],
+    fill_index: int,
+    pnl_lines: list[FillPnLLine],
+    cumulative_realized_start: float,
+) -> tuple[int, float]:
+    """Replay VAMM fills on a scratch ledger for per-leg net P&L attribution."""
+    scratch = PositionLedger()
+    scratch.position = snap.position
+    scratch.avg_entry_price = snap.avg_entry_price
+    cumulative = cumulative_realized_start
+
+    for fill in fills:
+        scored = _fill_with_competition_fee(fill)
+        net_this_fill = scratch.apply_fill(scored)
+        cumulative += net_this_fill
+        _record_fill_pnl(
+            scratch,
+            fill_index,
+            net_this_fill,
+            scored.fee_usd,
+            pnl_lines,
+            cumulative_net_pnl_usd=cumulative,
+        )
+        fill_index += 1
+
+    return fill_index, cumulative
+
+
 def run_backtest(
-    quotes: list[Quote],
+    quotes: list[Quote] | None = None,
     week: int = 1,
     stack: StrategyStack | None = None,
     daily_loss_limit_usd: float = 1_500.0,
     event_rows: list[dict[str, str]] | None = None,
+    csv_path: Path | str | None = None,
+    use_volume_aware_mm: bool = True,
 ) -> BacktestResult:
     if week < 1 or week > 4:
         raise ValueError(f"week must be 1–4, got {week}")
+    if quotes is None:
+        quotes = load_zn_min_csv(csv_path or DEFAULT_ZN_MIN_DATA_PATH)
     if not quotes:
         raise ValueError("quotes list is empty")
 
     weekly_min = weekly_volume_requirement(week)
     feature_engine = MicrostructureFeatureEngine()
-    strategy_stack = stack or StrategyStack()
     ledger = PositionLedger()
     risk = RiskState(daily_loss_limit_usd=daily_loss_limit_usd)
     signals_by_reason: dict[str, int] = {}
+    actions_by_engine: dict[str, int] = {}
     pnl_lines: list[FillPnLLine] = []
+    net_pnl_curve: list[NetPnLPoint] = []
     fill_index = 0
+
+    if use_volume_aware_mm:
+        vamm = VolumeAwareMarketMaking()
+    else:
+        strategy_stack = stack or StrategyStack()
 
     for idx, quote in enumerate(quotes):
         if risk.halted:
@@ -319,20 +393,57 @@ def run_backtest(
             surprise_10y_equiv_bp=surprise,
         )
 
-        signal = strategy_stack.on_tick(ctx)
-        if signal is None:
-            continue
+        if use_volume_aware_mm:
+            snap = _snapshot_ledger(ledger)
+            realized_before = ledger.realized_pnl_usd
+            step = vamm.process_tick(quote, book, ledger)
+            if step.fills:
+                fill_index, _ = _record_vamm_fills(
+                    snap,
+                    step.fills,
+                    fill_index,
+                    pnl_lines,
+                    realized_before,
+                )
+                risk.apply_realized(ledger.realized_pnl_usd - realized_before)
+            if step.action not in ("none", "idle"):
+                actions_by_engine[step.action] = (
+                    actions_by_engine.get(step.action, 0) + 1
+                )
+                signals_by_reason[step.action] = (
+                    signals_by_reason.get(step.action, 0) + 1
+                )
+        else:
+            from zn_competition.execution import execute_signal
 
-        signals_by_reason[signal.reason] = signals_by_reason.get(signal.reason, 0) + 1
-        fill = execute_signal(signal, quote, ledger.position)
-        if fill is None:
-            continue
+            signal = strategy_stack.on_tick(ctx)
+            if signal is not None:
+                signals_by_reason[signal.reason] = (
+                    signals_by_reason.get(signal.reason, 0) + 1
+                )
+                fill = execute_signal(signal, quote, ledger.position)
+                if fill is not None:
+                    net_this_fill = _apply_fill_and_record_pnl(
+                        ledger, fill, fill_index, pnl_lines
+                    )
+                    fill_index += 1
+                    risk.apply_realized(net_this_fill)
 
-        net_this_fill = _apply_fill_and_record_pnl(
-            ledger, fill, fill_index, pnl_lines
+        mark = quote.mid
+        mark_pnl = ledger.mark_price_pnl_usd(mark)
+        net_pnl_curve.append(
+            NetPnLPoint(
+                timestamp=quote.timestamp,
+                bar_index=idx,
+                position=ledger.position,
+                realized_pnl_usd=round(ledger.realized_pnl_usd, 4),
+                mark_pnl_usd=round(mark_pnl, 4),
+                cumulative_net_pnl_usd=round(
+                    ledger.realized_pnl_usd + mark_pnl, 4
+                ),
+                fees_paid_usd=round(ledger.total_fees_usd, 4),
+            )
         )
-        fill_index += 1
-        risk.apply_realized(net_this_fill)
 
     mark_pnl = ledger.mark_price_pnl_usd(quotes[-1].mid)
     gross_realized = ledger.realized_pnl_usd + ledger.total_fees_usd
@@ -354,6 +465,8 @@ def run_backtest(
         halt_reason=risk.halt_reason,
         signals_by_reason=signals_by_reason,
         pnl_lines=tuple(pnl_lines),
+        net_pnl_curve=tuple(net_pnl_curve),
+        actions_by_engine=actions_by_engine,
     )
     result.verify_fee_schedule()
     result.verify_net_pnl_identity()
@@ -361,9 +474,9 @@ def run_backtest(
 
 
 def run_backtest_csv(path: Path, week: int = 1) -> BacktestResult:
-    quotes = load_quotes(path)
+    quotes = load_zn_min_csv(path)
     event_rows: list[dict[str, str]] = []
-    with path.open(newline="", encoding="utf-8") as handle:
+    with path.open(newline="", encoding="utf-8-sig") as handle:
         reader = csv.DictReader(handle)
         if reader.fieldnames:
             for row in reader:
@@ -406,8 +519,7 @@ if __name__ == "__main__":
             week=int(sys.argv[2]) if len(sys.argv) > 2 else 1,
         )
     else:
-        synthetic = generate_synthetic_quotes()
-        result = run_backtest(synthetic, week=1)
+        result = run_backtest(week=1)
     print(result.to_json())
     plan = analyze_week_plan(1, result.leg_lots_traded)
     print("week_plan:", plan)
@@ -418,3 +530,11 @@ if __name__ == "__main__":
         f"(expected ${result.leg_lots_traded * FEE_PER_LOT_PER_SIDE_USD}, "
         f"RT=${FEE_PER_LOT_ROUND_TURN_USD}/lot)"
     )
+    if result.net_pnl_curve:
+        first = result.net_pnl_curve[0]
+        last = result.net_pnl_curve[-1]
+        print(
+            f"net_pnl_curve: {len(result.net_pnl_curve)} bars, "
+            f"start=${first.cumulative_net_pnl_usd:.2f}, "
+            f"end=${last.cumulative_net_pnl_usd:.2f}"
+        )

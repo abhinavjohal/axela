@@ -149,7 +149,12 @@ class TestExecution(unittest.TestCase):
 class TestBacktest(unittest.TestCase):
     def test_synthetic_run(self) -> None:
         quotes = generate_synthetic_quotes(300)
-        result = run_backtest(quotes, week=1)
+        result = run_backtest(
+            quotes,
+            week=1,
+            use_alpha_volume_platform=False,
+            obi_entry_threshold=0.7,
+        )
         self.assertGreaterEqual(result.leg_lots_traded, 0)
         self.assertIsInstance(result.net_pnl_usd, float)
 

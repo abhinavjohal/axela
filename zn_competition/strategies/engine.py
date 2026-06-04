@@ -1,7 +1,14 @@
 """
 Strategy stack with regime state machine and execution-layer order purge.
 
-Dual-regime OBI transition helper re-exported from ``obi_regime``.
+Master Plan (live TT canvas):
+
+- **Alpha Engine:** ``SniperOBIEngine`` @ 0.85 (or 0.75) — OBI sniper 24/7, directional edge only.
+- **Volume Engine:** ``VolumeChurner`` Module 4 — Generator 30s, flat-only, 1-lot bid+ask scratch.
+- **Coordinator:** ``AlphaVolumePlatform`` — OBI blocks churn while in trade (§9 arbitration).
+
+Legacy dual-regime ET clock remains in ``obi_regime`` for research; production backtest
+uses Alpha+Volume, not lowered OBI thresholds for volume.
 """
 
 from __future__ import annotations

@@ -336,8 +336,15 @@ class VolumeChurner:
 
         post_position = get_current_position(ledger)
         if post_position != 0:
+            scratch_fills = self._flatten_churn_inventory(quote, book, ledger)
+            if scratch_fills:
+                result.fills.extend(scratch_fills)
+                for sf in scratch_fills:
+                    self._record_leg(sf.lots)
+                result.action = "churn_scratch_flatten"
+            else:
+                result.action = "token_dropped_post_fill"
             self._drop_execution_token()
-            result.action = "token_dropped_post_fill"
             result.execution_token_active = False
         elif bid_fill and ask_fill:
             result.action = "churn_cycle_complete"
@@ -383,6 +390,42 @@ class VolumeChurner:
             self._ask_working = None
             result.quota_satisfied = True
             result.active = False
+
+    def _flatten_churn_inventory(
+        self,
+        quote: Quote,
+        book: OrderBookSnapshot,
+        ledger: PositionLedger,
+    ) -> list[FillRecord]:
+        """Scratch single-leg churn exposure at inside market ($0.50/side)."""
+        position = get_current_position(ledger)
+        if position == 0:
+            return []
+
+        lots = min(abs(position), self.churn_lots)
+        if position > 0:
+            side = Side.SELL
+            price = book.inside_ask
+            reason = "volume_churn_flatten_sell"
+        else:
+            side = Side.BUY
+            price = book.inside_bid
+            reason = "volume_churn_flatten_buy"
+
+        validate_order(
+            ledger.position,
+            OrderRequest(side, lots, reason=reason),
+        )
+        fill = FillRecord(
+            side=side,
+            lots=lots,
+            price=price,
+            fee_usd=lots * FEE_PER_LOT_PER_SIDE_USD,
+            timestamp=quote.timestamp,
+            reason=reason,
+        )
+        ledger.apply_fill(fill)
+        return [fill]
 
     def _try_fill_churn_order(
         self,

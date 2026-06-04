@@ -37,6 +37,9 @@ from zn_competition.strategies.obi_regime import (
     VOLUME_THRESHOLD,
 )
 
+# Alpha sniper default (24/7) — do not confuse with deprecated volume-mode OBI 0.65
+SNIPER_OBI_THRESHOLD = SNIPER_THRESHOLD  # 0.85
+
 # Legacy default for unit tests and static HFT instances
 OBI_ENTRY_THRESHOLD = 0.7
 OBI_FLIP_AGAINST_THRESHOLD = -0.7
@@ -119,6 +122,14 @@ class OrderBookImbalanceHFT:
         had_order = self._working_order is not None
         self._working_order = None
         return had_order
+
+    def blocks_volume_churn(self) -> bool:
+        """True when OBI has inventory or a resting entry (churn must wait)."""
+        return self._open_trade is not None or self._working_order is not None
+
+    @property
+    def has_open_trade(self) -> bool:
+        return self._open_trade is not None
 
     def book_from_context(self, ctx: StrategyContext) -> OrderBookSnapshot:
         if ctx.book is not None:
@@ -218,7 +229,10 @@ class OrderBookImbalanceHFT:
                 result.fills.append(fill)
                 result.action = "fill_passive"
                 return result
-            if not self._still_quoting_favorable(obi, self._working_order.side):
+            working = self._working_order
+            if working is not None and not self._still_quoting_favorable(
+                obi, working.side
+            ):
                 self._working_order = None
                 result.action = "cancel_unfavorable"
 
@@ -422,6 +436,32 @@ class OrderBookImbalanceHFT:
             entry_obi=0.0,
             opened_at="",
         )
+
+
+class SniperOBIEngine(OrderBookImbalanceHFT):
+    """
+    Alpha engine — high-selectivity OBI sniper, 24/7.
+
+    Fixed threshold (default 0.85). Never lowered to force competition volume;
+    volume is supplied by Module 4 ``VolumeChurner`` on a separate path.
+    """
+
+    name = "sniper_obi_alpha"
+
+    def __init__(
+        self,
+        quote_size: int = 1,
+        entry_threshold: float = SNIPER_OBI_THRESHOLD,
+    ) -> None:
+        super().__init__(
+            quote_size=quote_size,
+            entry_threshold=entry_threshold,
+            flip_threshold=-entry_threshold,
+            short_entry_threshold=-entry_threshold,
+        )
+
+    def _allows_new_entries(self) -> bool:
+        return True
 
 
 class DualRegimeOBIEngine(OrderBookImbalanceHFT):

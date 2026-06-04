@@ -47,7 +47,12 @@ class TestBacktestPnL(unittest.TestCase):
         )
 
     def test_vamm_net_pnl_curve(self) -> None:
-        result = run_backtest(generate_synthetic_quotes(60), week=1)
+        result = run_backtest(
+            generate_synthetic_quotes(60),
+            week=1,
+            use_alpha_volume_platform=False,
+            obi_entry_threshold=0.7,
+        )
         self.assertEqual(result.position_end, 0)
         self.assertEqual(len(result.net_pnl_curve), 60)
         self.assertAlmostEqual(

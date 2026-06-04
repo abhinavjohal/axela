@@ -42,10 +42,20 @@ ZN is a **rates beta** instrument: your alpha is timing **yield shocks** and **m
 - **Off** during blocked events (FOMC, NFP, CPI, auctions).
 - Target hold &lt; 15 min; passive entry, aggressive exit.
 
-### Sleeve C — Volume pad (last resort)
+### Master Plan — Alpha Sniper + Module 4 Volume Churner (production)
 
-- Passive quotes when weekly min at risk and vol &lt; 4 ticks/hour.
-- Expect **negative** edge per lot; use micros for remainder if ZN vol too high.
+Two **independent** TT paths (see `TT_ADL_SPECIFICATION.md` §8.0, `alpha_volume_platform.py`):
+
+| Engine | Role | Rule |
+|--------|------|------|
+| **Alpha** | `SniperOBIEngine` @ **0.85** (or 0.75) | OBI directional sniper **24/7** — never lower threshold to force volume |
+| **Volume** | `VolumeChurner` @ **30s** generator | When **flat (0)**, arm 1-lot bid + 1-lot ask; scratch ≈ **$1.00 RT** for **2 legs** |
+
+- OBI has priority: churn is blocked while alpha has open trade or resting entry.
+- Do **not** use OBI 0.55–0.65 for volume — that destroys sniper edge.
+- Budget churn fees from alpha P&L (`expected_scratch_cost_usd` per cycle).
+
+Backtest: `python3 -m zn_competition.backtest` (default platform mode).
 
 ---
 

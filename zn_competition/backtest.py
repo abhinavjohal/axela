@@ -29,16 +29,21 @@ from zn_competition.risk import FillRecord, PositionLedger, RiskState
 from zn_competition.specs import (
     FEE_PER_LOT_PER_SIDE_USD,
     FEE_PER_LOT_ROUND_TURN_USD,
+    TICK_SIZE_FLOAT,
     ZN_SEP26,
     weekly_volume_requirement,
 )
+from zn_competition.strategies.alpha_volume_platform import (
+    SNIPER_OBI_THRESHOLD_DEFAULT,
+    AlphaVolumePlatform,
+)
 from zn_competition.strategies.base import Side, StrategyContext
-from zn_competition.strategies.engine import StrategyStack
-from zn_competition.strategies.engine import handle_dual_regime_transition
+from zn_competition.strategies.engine import StrategyStack, handle_dual_regime_transition
 from zn_competition.strategies.obi_regime import DualRegimeSessionClock, OBIRegimeMode
 from zn_competition.strategies.volume_aware_mm import (
     DualRegimeOBIEngine,
     OrderBookImbalanceHFT,
+    SniperOBIEngine,
     VolumeAwareMarketMaking,
 )
 
@@ -116,6 +121,7 @@ class BacktestResult:
     net_pnl_curve: tuple[NetPnLPoint, ...] = field(default_factory=tuple)
     actions_by_engine: dict[str, int] = field(default_factory=dict)
     dual_regime_stats: dict[str, int] = field(default_factory=dict)
+    alpha_volume_stats: dict[str, int | float] = field(default_factory=dict)
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2)
@@ -322,14 +328,15 @@ def _snapshot_ledger(ledger: PositionLedger) -> _LedgerSnapshot:
     )
 
 
-def _record_vamm_fills(
+def _record_fills_on_ledger(
+    ledger: PositionLedger,
     snap: _LedgerSnapshot,
     fills: list[FillRecord],
     fill_index: int,
     pnl_lines: list[FillPnLLine],
     cumulative_realized_start: float,
 ) -> tuple[int, float]:
-    """Replay VAMM fills on a scratch ledger for per-leg net P&L attribution."""
+    """Replay fills from a snapshot for per-leg net P&L attribution."""
     scratch = PositionLedger()
     scratch.position = snap.position
     scratch.avg_entry_price = snap.avg_entry_price
@@ -350,6 +357,9 @@ def _record_vamm_fills(
         fill_index += 1
 
     return fill_index, cumulative
+
+
+_record_vamm_fills = _record_fills_on_ledger
 
 
 # CME Globex ZN weekly halt: Friday ~16:00 CT → 21:00 UTC (CDT). Flatten from 20:00 UTC.
@@ -439,6 +449,8 @@ def run_backtest(
     use_volume_aware_mm: bool = True,
     obi_entry_threshold: float | None = None,
     use_dual_regime: bool | None = None,
+    use_alpha_volume_platform: bool | None = None,
+    sniper_threshold: float = SNIPER_OBI_THRESHOLD_DEFAULT,
 ) -> BacktestResult:
     if week < 1 or week > 4:
         raise ValueError(f"week must be 1–4, got {week}")
@@ -456,10 +468,19 @@ def run_backtest(
     pnl_lines: list[FillPnLLine] = []
     net_pnl_curve: list[NetPnLPoint] = []
     fill_index = 0
+    alpha_volume = (
+        use_alpha_volume_platform
+        if use_alpha_volume_platform is not None
+        else (
+            obi_entry_threshold is None
+            and use_volume_aware_mm
+            and use_dual_regime is not True
+        )
+    )
     dual_regime = (
-        use_dual_regime
+        use_dual_regime is True
         if use_dual_regime is not None
-        else (obi_entry_threshold is None and use_volume_aware_mm)
+        else False
     )
     regime_clock = DualRegimeSessionClock() if dual_regime else None
     regime_stats: dict[str, int] = {
@@ -469,6 +490,17 @@ def run_backtest(
         "regime_shifts": 0,
         "stale_order_cancels": 0,
     }
+    platform_stats: dict[str, int | float] = {
+        "sniper_threshold": sniper_threshold,
+        "alpha_fills": 0,
+        "volume_fills": 0,
+        "churn_pulses": 0,
+        "churn_cycles_complete": 0,
+        "obi_blocks_churn": 0,
+    }
+
+    platform: AlphaVolumePlatform | None = None
+    vamm: OrderBookImbalanceHFT | None = None
 
     if use_volume_aware_mm:
         if obi_entry_threshold is not None:
@@ -477,6 +509,9 @@ def run_backtest(
                 flip_threshold=-obi_entry_threshold,
                 short_entry_threshold=-obi_entry_threshold,
             )
+        elif alpha_volume:
+            platform = AlphaVolumePlatform.with_sniper_threshold(sniper_threshold)
+            vamm = platform.alpha
         elif dual_regime:
             vamm = DualRegimeOBIEngine()
         else:
@@ -495,7 +530,10 @@ def run_backtest(
         risk_flatten = friday_flatten or pre_weekend_gap
 
         if risk_flatten and use_volume_aware_mm:
-            vamm.reset()
+            if platform is not None:
+                platform.reset()
+            elif vamm is not None:
+                vamm.reset()
             if regime_clock is not None:
                 regime_clock.reset()
 
@@ -525,7 +563,7 @@ def run_backtest(
             surprise_10y_equiv_bp=surprise,
         )
 
-        if use_volume_aware_mm:
+        if use_volume_aware_mm and vamm is not None:
             if dual_regime and regime_clock is not None:
                 snapshot = regime_clock.evaluate(quote.timestamp)
                 if snapshot.mode == OBIRegimeMode.SNIPER_MODE:
@@ -548,23 +586,66 @@ def run_backtest(
             if not risk_flatten:
                 snap = _snapshot_ledger(ledger)
                 realized_before = ledger.realized_pnl_usd
-                step = vamm.process_tick(quote, book, ledger)
-                if step.fills:
-                    fill_index, _ = _record_vamm_fills(
-                        snap,
-                        step.fills,
-                        fill_index,
-                        pnl_lines,
-                        realized_before,
+
+                if platform is not None:
+                    step = platform.process_tick(quote, book, ledger, ctx)
+                    all_fills = step.alpha_fills + (
+                        step.volume_fills if step.volume_fills else []
                     )
-                    risk.apply_realized(ledger.realized_pnl_usd - realized_before)
-                if step.action not in ("none", "idle"):
-                    actions_by_engine[step.action] = (
-                        actions_by_engine.get(step.action, 0) + 1
-                    )
-                    signals_by_reason[step.action] = (
-                        signals_by_reason.get(step.action, 0) + 1
-                    )
+                    if step.alpha_fills:
+                        platform_stats["alpha_fills"] += len(step.alpha_fills)
+                    if step.volume_fills:
+                        platform_stats["volume_fills"] += len(step.volume_fills)
+                    if step.volume and step.volume.pulse_fired:
+                        platform_stats["churn_pulses"] += 1
+                    if step.volume and step.volume.action == "churn_cycle_complete":
+                        platform_stats["churn_cycles_complete"] += 1
+                    if step.volume and step.volume.action == "obi_priority_block":
+                        platform_stats["obi_blocks_churn"] += 1
+                    if all_fills:
+                        fill_index, _ = _record_fills_on_ledger(
+                            ledger,
+                            snap,
+                            all_fills,
+                            fill_index,
+                            pnl_lines,
+                            realized_before,
+                        )
+                        risk.apply_realized(
+                            ledger.realized_pnl_usd - realized_before
+                        )
+                    for action in (
+                        step.alpha.action,
+                        step.volume.action if step.volume else "none",
+                    ):
+                        if action not in ("none", "idle", "pulse_wait"):
+                            actions_by_engine[action] = (
+                                actions_by_engine.get(action, 0) + 1
+                            )
+                            signals_by_reason[action] = (
+                                signals_by_reason.get(action, 0) + 1
+                            )
+                else:
+                    obi_step = vamm.process_tick(quote, book, ledger)
+                    if obi_step.fills:
+                        fill_index, _ = _record_fills_on_ledger(
+                            ledger,
+                            snap,
+                            obi_step.fills,
+                            fill_index,
+                            pnl_lines,
+                            realized_before,
+                        )
+                        risk.apply_realized(
+                            ledger.realized_pnl_usd - realized_before
+                        )
+                    if obi_step.action not in ("none", "idle"):
+                        actions_by_engine[obi_step.action] = (
+                            actions_by_engine.get(obi_step.action, 0) + 1
+                        )
+                        signals_by_reason[obi_step.action] = (
+                            signals_by_reason.get(obi_step.action, 0) + 1
+                        )
         else:
             from zn_competition.execution import execute_signal
 
@@ -579,8 +660,6 @@ def run_backtest(
                         ledger, fill, fill_index, pnl_lines
                     )
                     fill_index += 1
-                    risk.apply_realized(net_this_fill)
-
                     risk.apply_realized(net_this_fill)
 
         flatten_reason: str | None = None
@@ -601,7 +680,7 @@ def run_backtest(
                 flatten_reason,
                 fill_index,
                 pnl_lines,
-                vamm if use_volume_aware_mm else None,
+                vamm if use_volume_aware_mm and vamm is not None else None,
             )
             if len(ledger.fills) > fills_before:
                 risk.apply_realized(ledger.realized_pnl_usd - realized_before)
@@ -649,31 +728,46 @@ def run_backtest(
         net_pnl_curve=tuple(net_pnl_curve),
         actions_by_engine=actions_by_engine,
         dual_regime_stats=regime_stats if dual_regime else {},
+        alpha_volume_stats=platform_stats if platform is not None else {},
     )
     result.verify_fee_schedule()
     result.verify_net_pnl_identity()
     return result
 
 
-def print_dual_regime_summary(result: BacktestResult) -> None:
-    """Console summary for dual-regime OBI backtest runs."""
-    print("=" * 56)
-    print("  Dual-Regime OBI Backtest Summary")
-    print("=" * 56)
-    print(f"  Total Lots Traded:     {result.leg_lots_traded}")
-    print(f"  Gross P&L (USD):       ${result.gross_pnl_usd:,.2f}")
-    print(f"  Total Commission:      ${result.total_fees_usd:,.2f}")
-    print(f"  Net P&L (USD):         ${result.net_pnl_usd:,.2f}")
-    print(f"  Position at EOF:       {result.position_end}")
+def print_alpha_volume_summary(result: BacktestResult) -> None:
+    """Console summary for Alpha Sniper + Module 4 Volume Churner backtest."""
+    print("=" * 60)
+    print("  Alpha Sniper + Volume Churner — Backtest Summary")
+    print("=" * 60)
+    print(f"  Total Lots Traded:       {result.leg_lots_traded}")
+    print(f"  Weekly Min (legs):       {result.weekly_min_legs}")
+    print(f"  Met Volume Minimum:      {result.met_volume_min}")
+    print(f"  Gross P&L (USD):         ${result.gross_pnl_usd:,.2f}")
+    print(f"  Total Commission:        ${result.total_fees_usd:,.2f}")
+    print(f"  Net P&L (USD):           ${result.net_pnl_usd:,.2f}")
+    print(f"  Position at EOF:         {result.position_end}")
+    if result.alpha_volume_stats:
+        s = result.alpha_volume_stats
+        print("-" * 60)
+        print(f"  Sniper OBI threshold:    {s.get('sniper_threshold', 'n/a')}")
+        print(f"  Alpha (OBI) fill legs:   {s.get('alpha_fills', 0)}")
+        print(f"  Volume churn fill legs:  {s.get('volume_fills', 0)}")
+        print(f"  Churn generator pulses:  {s.get('churn_pulses', 0)}")
+        print(f"  Churn cycles complete:   {s.get('churn_cycles_complete', 0)}")
+        print(f"  OBI blocked churn ticks: {s.get('obi_blocks_churn', 0)}")
     if result.dual_regime_stats:
         stats = result.dual_regime_stats
-        print("-" * 56)
-        print(f"  Sniper window bars:    {stats.get('sniper_bars', 0)}")
-        print(f"  Volume window bars:    {stats.get('volume_bars', 0)}")
-        print(f"  Off-session bars:      {stats.get('off_bars', 0)}")
-        print(f"  Regime shifts:         {stats.get('regime_shifts', 0)}")
-        print(f"  Stale order cancels:   {stats.get('stale_order_cancels', 0)}")
-    print("=" * 56)
+        print("-" * 60)
+        print("  (legacy dual-regime stats)")
+        print(f"  Sniper window bars:      {stats.get('sniper_bars', 0)}")
+        print(f"  Volume window bars:      {stats.get('volume_bars', 0)}")
+    print("=" * 60)
+
+
+def print_dual_regime_summary(result: BacktestResult) -> None:
+    """Backward-compatible alias."""
+    print_alpha_volume_summary(result)
 
 
 def run_backtest_csv(path: Path, week: int = 1) -> BacktestResult:
@@ -696,9 +790,11 @@ def generate_synthetic_quotes(count: int = 500, base_price: float = 112.0) -> li
     for i in range(count):
         drift = ((i % 17) - 8) * (1 / 64) * 0.1
         mid = max(100.0, mid + drift)
-        half_spread = 1 / 128
-        direct_bid = mid - half_spread
-        direct_ask = mid + half_spread
+        half_spread = max(TICK_SIZE_FLOAT / 2, 1 / 128)
+        direct_bid = ZN_SEP26.round_price_to_tick(mid - half_spread)
+        direct_ask = ZN_SEP26.round_price_to_tick(mid + half_spread)
+        if direct_ask <= direct_bid:
+            direct_ask = ZN_SEP26.round_price_to_tick(direct_bid + TICK_SIZE_FLOAT)
         row = Level1MarketRow(
             direct_bid_price=round(direct_bid, 6),
             direct_ask_price=round(direct_ask, 6),
@@ -722,8 +818,8 @@ if __name__ == "__main__":
             week=int(sys.argv[2]) if len(sys.argv) > 2 else 1,
         )
     else:
-        result = run_backtest(week=1, use_dual_regime=True)
-    print_dual_regime_summary(result)
+        result = run_backtest(week=1, use_alpha_volume_platform=True)
+    print_alpha_volume_summary(result)
     print()
     print(result.to_json())
     plan = analyze_week_plan(1, result.leg_lots_traded)

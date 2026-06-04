@@ -242,7 +242,7 @@ from zn_competition.strategies.base import StrategyContext
 from zn_competition.strategies.engine import StrategyStack
 from zn_competition.strategies.macro_event import MacroEventStrategy
 from zn_competition.strategies.session_mr import SessionMeanReversionStrategy
-from zn_competition.strategies.volume_aware_mm import OrderBookImbalanceHFT
+from zn_competition.strategies.alpha_volume_platform import AlphaVolumePlatform
 
 
 @dataclass(frozen=True)
@@ -391,7 +391,7 @@ class HistoricalSimulator:
             ],
             execution=self.execution,
         )
-        self.obi = OrderBookImbalanceHFT()
+        self.platform = AlphaVolumePlatform.with_sniper_threshold()
         self.signals_by_reason: dict[str, int] = {}
         self.actions_by_engine: dict[str, int] = {}
 
@@ -433,18 +433,18 @@ class HistoricalSimulator:
         _assert_ledger_position_cap(self.ledger)
         ctx = _build_context(quote, features, self.ledger, self.week, self.weekly_min)
 
-        obi_result = self.obi.process_tick(quote, book, self.ledger)
-        if obi_result.action != "none" and obi_result.action != "idle":
-            self._record_action(f"obi:{obi_result.action}")
-
-        _assert_ledger_position_cap(self.ledger)
-        ctx = _build_context(quote, features, self.ledger, self.week, self.weekly_min)
-
-        churn = self.session_mr.process_churn_pulse(
+        platform_step = self.platform.process_tick(
             quote, book, self.ledger, ctx
         )
-        if churn is not None and churn.action not in ("idle", "none", "pulse_wait"):
-            self._record_action(f"churn:{churn.action}")
+        if platform_step.alpha.action not in ("none", "idle"):
+            self._record_action(f"alpha:{platform_step.alpha.action}")
+        if platform_step.volume and platform_step.volume.action not in (
+            "idle",
+            "none",
+            "pulse_wait",
+            "obi_priority_block",
+        ):
+            self._record_action(f"churn:{platform_step.volume.action}")
 
         _assert_ledger_position_cap(self.ledger)
 

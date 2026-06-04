@@ -33,7 +33,10 @@ from zn_competition.specs import (
 )
 from zn_competition.strategies.base import StrategyContext
 from zn_competition.strategies.engine import StrategyStack
-from zn_competition.strategies.volume_aware_mm import VolumeAwareMarketMaking
+from zn_competition.strategies.volume_aware_mm import (
+    OrderBookImbalanceHFT,
+    VolumeAwareMarketMaking,
+)
 
 REQUIRED_PRICE_COLUMNS_ANY = (
     frozenset({"bid", "ask"}),
@@ -340,6 +343,7 @@ def run_backtest(
     event_rows: list[dict[str, str]] | None = None,
     csv_path: Path | str | None = None,
     use_volume_aware_mm: bool = True,
+    obi_entry_threshold: float | None = None,
 ) -> BacktestResult:
     if week < 1 or week > 4:
         raise ValueError(f"week must be 1–4, got {week}")
@@ -359,7 +363,14 @@ def run_backtest(
     fill_index = 0
 
     if use_volume_aware_mm:
-        vamm = VolumeAwareMarketMaking()
+        if obi_entry_threshold is not None:
+            vamm = OrderBookImbalanceHFT(
+                entry_threshold=obi_entry_threshold,
+                flip_threshold=-obi_entry_threshold,
+                short_entry_threshold=-obi_entry_threshold,
+            )
+        else:
+            vamm = VolumeAwareMarketMaking()
     else:
         strategy_stack = stack or StrategyStack()
 

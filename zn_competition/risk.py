@@ -7,7 +7,12 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 
-from zn_competition.specs import FEE_PER_LOT_PER_SIDE_USD, MAX_POSITION_LOTS, ZN_SEP26
+from zn_competition.specs import (
+    FEE_PER_LOT_PER_SIDE_USD,
+    MAX_POSITION_LOTS,
+    InstrumentSpec,
+    get_instrument_spec,
+)
 from zn_competition.strategies.base import Side
 
 logger = logging.getLogger(__name__)
@@ -268,15 +273,25 @@ class PositionLedger:
     total_fees_usd: float = 0.0
     realized_pnl_usd: float = 0.0
     fills: list[FillRecord] = field(default_factory=list)
+    instrument: InstrumentSpec | None = None
+
+    def __post_init__(self) -> None:
+        if self.instrument is None:
+            self.instrument = get_instrument_spec("ZN")
+
+    def _spec(self) -> InstrumentSpec:
+        assert self.instrument is not None
+        return self.instrument
 
     def mark_price_pnl_usd(self, mark: float) -> float:
         if self.position == 0:
             return 0.0
+        spec = self._spec()
         if self.position > 0:
-            ticks = ZN_SEP26.price_delta_to_ticks(mark - self.avg_entry_price)
+            ticks = spec.price_delta_to_ticks(mark - self.avg_entry_price)
         else:
-            ticks = ZN_SEP26.price_delta_to_ticks(self.avg_entry_price - mark)
-        return ZN_SEP26.ticks_to_dollars(ticks, abs(self.position))
+            ticks = spec.price_delta_to_ticks(self.avg_entry_price - mark)
+        return spec.ticks_to_dollars(ticks, abs(self.position))
 
     def apply_fill(self, fill: FillRecord) -> float:
         if fill.lots <= 0:
@@ -355,9 +370,11 @@ class PositionLedger:
         return gross
 
     def _close_long(self, lots: int, price: float) -> float:
-        ticks = ZN_SEP26.price_delta_to_ticks(price - self.avg_entry_price)
-        return ZN_SEP26.ticks_to_dollars(ticks, lots)
+        spec = self._spec()
+        ticks = spec.price_delta_to_ticks(price - self.avg_entry_price)
+        return spec.ticks_to_dollars(ticks, lots)
 
     def _close_short(self, lots: int, price: float) -> float:
-        ticks = ZN_SEP26.price_delta_to_ticks(self.avg_entry_price - price)
-        return ZN_SEP26.ticks_to_dollars(ticks, lots)
+        spec = self._spec()
+        ticks = spec.price_delta_to_ticks(self.avg_entry_price - price)
+        return spec.ticks_to_dollars(ticks, lots)

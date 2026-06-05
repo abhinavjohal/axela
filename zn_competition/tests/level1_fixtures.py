@@ -21,22 +21,22 @@ BALANCED_L1 = Level1MarketRow(
     ask_order_count=4,
 )
 
-# Strong bid-side OBI > 0.7 for HFT long entry tests
+# Strong bid-side OBI > 0.7 for HFT long entry tests (combined qty >= ZN min 200)
 BULLISH_L1 = Level1MarketRow(
     direct_bid_price=112.0,
     direct_ask_price=112.03125,
-    direct_bid_qty=110,
+    direct_bid_qty=190,
     direct_ask_qty=10,
     bid_order_count=20,
     ask_order_count=5,
 )
 
-# Strong ask-side OBI for scratch / flip tests
+# Strong ask-side OBI for scratch / flip tests (combined qty >= ZN min 200)
 BEARISH_L1 = Level1MarketRow(
     direct_bid_price=112.0,
     direct_ask_price=112.03125,
     direct_bid_qty=10,
-    direct_ask_qty=110,
+    direct_ask_qty=190,
     bid_order_count=5,
     ask_order_count=20,
     timestamp="2026-06-03T14:00:01+00:00",

@@ -21,12 +21,18 @@ from zn_competition.risk import ExecutionException, PositionLedger, RiskState
 from zn_competition.specs import (
     FEE_PER_LOT_PER_SIDE_USD,
     MAX_POSITION_LOTS,
-    TICK_SIZE_FLOAT,
-    ZN_SEP26,
+    InstrumentSpec,
+    get_instrument_spec,
+    resolve_min_data_path,
     weekly_volume_requirement,
 )
+from zn_competition.strategies.alpha_volume_platform import AlphaVolumePlatform
+from zn_competition.strategies.base import StrategyContext
+from zn_competition.strategies.engine import StrategyStack
+from zn_competition.strategies.macro_event import MacroEventStrategy
+from zn_competition.strategies.session_mr import SessionMeanReversionStrategy
 
-DEFAULT_ZN_MIN_DATA_PATH = Path(__file__).resolve().parent / "data" / "zn_min_data.csv"
+DEFAULT_ZN_MIN_DATA_PATH = resolve_min_data_path("ZN")
 
 _TIMESTAMP_ALIASES = (
     "timestamp",
@@ -118,13 +124,17 @@ def _normalize_timestamp(raw: str) -> str:
     return text.replace(" ", "T") + "+00:00"
 
 
-def row_to_level1_dict(row: Mapping[str, str]) -> dict[str, float | int | str]:
+def row_to_level1_dict(
+    row: Mapping[str, str],
+    instrument_id: str = "ZN",
+) -> dict[str, float | int | str]:
     """
     Map one CSV row to internal Level 1 fields.
 
     Supports explicit L1 columns or OHLC-only bars (derives inside market and
     qty proxies from bar geometry for OBI simulation).
     """
+    spec = get_instrument_spec(instrument_id)
     timestamp = _normalize_timestamp(_cell(row, *_TIMESTAMP_ALIASES))
     if not timestamp:
         raise ValueError("CSV row missing timestamp column")
@@ -152,15 +162,15 @@ def row_to_level1_dict(row: Mapping[str, str]) -> dict[str, float | int | str]:
     bar_low = min(low, anchor, high) if anchor else low
 
     if bid_price_raw and ask_price_raw:
-        direct_bid_price = ZN_SEP26.round_price_to_tick(_parse_float(bid_price_raw))
-        direct_ask_price = ZN_SEP26.round_price_to_tick(_parse_float(ask_price_raw))
+        direct_bid_price = spec.round_price_to_tick(_parse_float(bid_price_raw))
+        direct_ask_price = spec.round_price_to_tick(_parse_float(ask_price_raw))
     elif anchor:
-        half_spread = max((bar_high - bar_low) / 2.0, TICK_SIZE_FLOAT / 2.0)
-        direct_bid_price = ZN_SEP26.round_price_to_tick(anchor - half_spread)
-        direct_ask_price = ZN_SEP26.round_price_to_tick(anchor + half_spread)
+        half_spread = max((bar_high - bar_low) / 2.0, spec.tick_size / 2.0)
+        direct_bid_price = spec.round_price_to_tick(anchor - half_spread)
+        direct_ask_price = spec.round_price_to_tick(anchor + half_spread)
         if direct_ask_price <= direct_bid_price:
-            direct_ask_price = ZN_SEP26.round_price_to_tick(
-                direct_bid_price + TICK_SIZE_FLOAT
+            direct_ask_price = spec.round_price_to_tick(
+                direct_bid_price + spec.tick_size
             )
     else:
         raise ValueError(f"Row {timestamp!r}: no bid/ask or OHLC price columns")
@@ -169,7 +179,7 @@ def row_to_level1_dict(row: Mapping[str, str]) -> dict[str, float | int | str]:
         direct_bid_qty = max(1, _parse_int(bid_qty_raw, 1))
         direct_ask_qty = max(1, _parse_int(ask_qty_raw, 1))
     elif anchor:
-        tick = TICK_SIZE_FLOAT
+        tick = spec.tick_size
         close_to_low_ticks = max(0.0, (anchor - bar_low) / tick)
         close_to_high_ticks = max(0.0, (bar_high - anchor) / tick)
         base_qty = 20
@@ -185,6 +195,7 @@ def row_to_level1_dict(row: Mapping[str, str]) -> dict[str, float | int | str]:
 
     return {
         "timestamp": timestamp,
+        "instrument_id": spec.instrument_id,
         "direct_bid_price": direct_bid_price,
         "direct_ask_price": direct_ask_price,
         "direct_bid_qty": direct_bid_qty,
@@ -194,7 +205,11 @@ def row_to_level1_dict(row: Mapping[str, str]) -> dict[str, float | int | str]:
     }
 
 
-def level1_dict_to_quote(fields: Mapping[str, float | int | str]) -> Quote:
+def level1_dict_to_quote(
+    fields: Mapping[str, float | int | str],
+    instrument_id: str = "ZN",
+) -> Quote:
+    asset = str(fields.get("instrument_id", instrument_id))
     return quote_from_level1(
         Level1MarketRow(
             timestamp=str(fields["timestamp"]),
@@ -204,17 +219,28 @@ def level1_dict_to_quote(fields: Mapping[str, float | int | str]) -> Quote:
             direct_ask_qty=int(fields["direct_ask_qty"]),
             bid_order_count=int(fields["bid_order_count"]),
             ask_order_count=int(fields["ask_order_count"]),
-        )
+        ),
+        instrument_id=asset,
     )
 
 
-def load_zn_min_csv(path: Path | str | None = None) -> list[Quote]:
+def load_min_csv(
+    path: Path | str | None = None,
+    instrument_id: str = "ZN",
+) -> list[Quote]:
     """
-    Load 1-minute ZN historical CSV chronologically into Level 1 ``Quote`` rows.
+    Load 1-minute historical CSV chronologically into Level 1 ``Quote`` rows.
 
-    Default path: ``zn_competition/data/zn_min_data.csv``.
+    Parameters
+    ----------
+    path:
+        Optional explicit CSV path. When omitted, resolves the default file for
+        ``instrument_id`` (``zn_min_data.csv``, ``mes_min_data.csv``, etc.).
+    instrument_id:
+        Competition instrument id (``ZN`` Sep26).
     """
-    csv_path = Path(path) if path is not None else DEFAULT_ZN_MIN_DATA_PATH
+    spec = get_instrument_spec(instrument_id)
+    csv_path = resolve_min_data_path(spec.instrument_id, path)
     if not csv_path.is_file():
         raise FileNotFoundError(f"Historical CSV not found: {csv_path}")
 
@@ -227,8 +253,8 @@ def load_zn_min_csv(path: Path | str | None = None) -> list[Quote]:
             if not any(v and str(v).strip() for v in row.values()):
                 continue
             try:
-                fields = row_to_level1_dict(row)
-                quote = level1_dict_to_quote(fields)
+                fields = row_to_level1_dict(row, instrument_id=spec.instrument_id)
+                quote = level1_dict_to_quote(fields, instrument_id=spec.instrument_id)
                 rows.append((str(fields["timestamp"]), quote))
             except (ValueError, TypeError) as exc:
                 raise ValueError(f"{csv_path}:{line_no}: {exc}") from exc
@@ -238,11 +264,11 @@ def load_zn_min_csv(path: Path | str | None = None) -> list[Quote]:
 
     rows.sort(key=lambda item: item[0])
     return [quote for _, quote in rows]
-from zn_competition.strategies.base import StrategyContext
-from zn_competition.strategies.engine import StrategyStack
-from zn_competition.strategies.macro_event import MacroEventStrategy
-from zn_competition.strategies.session_mr import SessionMeanReversionStrategy
-from zn_competition.strategies.alpha_volume_platform import AlphaVolumePlatform
+
+
+def load_zn_min_csv(path: Path | str | None = None) -> list[Quote]:
+    """Load ZN Sep26 1-minute historical CSV."""
+    return load_min_csv(path=path, instrument_id="ZN")
 
 
 @dataclass(frozen=True)
@@ -286,6 +312,7 @@ class HistoricalSummary:
 def generate_mock_order_book_stream(
     count: int = 400,
     base_price: float = 112.0,
+    instrument_id: str = "ZN",
 ) -> list[Quote]:
     """
     Deterministic mock Level 1 book updates for offline strategy replay.
@@ -294,15 +321,18 @@ def generate_mock_order_book_stream(
     """
     if count < 20:
         raise ValueError("count must be >= 20")
+    spec = get_instrument_spec(instrument_id)
     quotes: list[Quote] = []
     mid = base_price
-    half_spread = 1 / 128
+    half_spread = spec.tick_size / 2.0
 
     for i in range(count):
-        drift = ((i % 13) - 6) * (TICK_SIZE_FLOAT * 0.08)
-        mid = max(100.0, mid + drift)
-        bid = round(mid - half_spread, 6)
-        ask = round(mid + half_spread, 6)
+        drift = ((i % 13) - 6) * (spec.tick_size * 0.08)
+        mid = max(spec.tick_size, mid + drift)
+        bid = spec.round_price_to_tick(mid - half_spread)
+        ask = spec.round_price_to_tick(mid + half_spread)
+        if ask <= bid:
+            ask = spec.round_price_to_tick(bid + spec.tick_size)
 
         if i % 40 < 20:
             direct_bid_qty, direct_ask_qty = 125, 14
@@ -324,6 +354,7 @@ def generate_mock_order_book_stream(
                 bid_order_count=bid_order_count,
                 ask_order_count=ask_order_count,
                 volume=1 + (i % 4),
+                instrument_id=spec.instrument_id,
             )
         )
     return quotes
@@ -488,7 +519,7 @@ def run_historical_loop(
     if quotes is not None:
         stream = quotes
     elif csv_path is not None or DEFAULT_ZN_MIN_DATA_PATH.is_file():
-        stream = load_zn_min_csv(csv_path)
+        stream = load_min_csv(csv_path)
     else:
         stream = generate_mock_order_book_stream()
     return HistoricalSimulator(week=week).run(stream)

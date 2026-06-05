@@ -23,9 +23,9 @@ from zn_competition.specs import (
     CT,
     FEE_PER_LOT_PER_SIDE_USD,
     HIGH_IMPACT_MACRO_TAGS,
-    TICK_SIZE_FLOAT,
     TOTAL_VOLUME_MIN,
     ZN_SEP26,
+    get_instrument_spec,
     weekly_volume_requirement,
 )
 from zn_competition.strategies.base import Side, Signal, StrategyContext
@@ -295,7 +295,8 @@ class VolumeChurner:
             result.execution_token_active = False
             return result
 
-        spread_ticks = (book.ask - book.bid) / TICK_SIZE_FLOAT
+        spec = get_instrument_spec(book.instrument_id)
+        spread_ticks = spec.price_delta_to_ticks(book.ask - book.bid)
         if spread_ticks > self.max_spread_ticks:
             self._drop_execution_token()
             result.action = "spread_blocked"
@@ -438,15 +439,16 @@ class VolumeChurner:
         if order is None:
             return None
 
+        spec = get_instrument_spec(book.instrument_id)
         if side == Side.BUY:
-            if abs(ZN_SEP26.round_price_to_tick(quote.bid) - order.limit_price) > 1e-9:
+            if abs(spec.round_price_to_tick(quote.bid) - order.limit_price) > 1e-9:
                 return None
             lots = clip_order_size(order.lots, ledger.position)
             if lots <= 0:
                 return None
             validate_order(ledger.position, OrderRequest(Side.BUY, lots, order.reason))
         else:
-            if abs(ZN_SEP26.round_price_to_tick(quote.ask) - order.limit_price) > 1e-9:
+            if abs(spec.round_price_to_tick(quote.ask) - order.limit_price) > 1e-9:
                 return None
             lots = clip_order_size(order.lots, ledger.position)
             if lots <= 0:

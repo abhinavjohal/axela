@@ -30,6 +30,7 @@ credentials.json
 # Backtest / logs
 logs/
 output/
+zn_competition/results/
 *.log
 
 # Jupyter

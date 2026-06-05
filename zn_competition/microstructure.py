@@ -8,7 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from math import sqrt
 
-from zn_competition.specs import TICK_SIZE_FLOAT, ZN_SEP26
+from zn_competition.specs import TICK_SIZE_FLOAT, ZN_SEP26, get_instrument_spec
 
 # TT ADL Level 1 field names (inside market direct quantities + order counts).
 LEVEL1_PRICE_FIELDS = frozenset({"direct_bid_price", "direct_ask_price"})
@@ -58,6 +58,7 @@ class Quote:
     ask_order_count: int = 1
     last: float | None = None
     volume: int = 0
+    instrument_id: str = "ZN"
 
     def __post_init__(self) -> None:
         if self.bid <= 0 or self.ask <= 0:
@@ -77,10 +78,11 @@ class Quote:
 
     @property
     def spread_ticks(self) -> float:
-        return ZN_SEP26.price_delta_to_ticks(self.ask - self.bid)
+        spec = get_instrument_spec(self.instrument_id)
+        return spec.price_delta_to_ticks(self.ask - self.bid)
 
     def round_mid_to_tick(self) -> float:
-        return ZN_SEP26.round_price_to_tick(self.mid)
+        return get_instrument_spec(self.instrument_id).round_price_to_tick(self.mid)
 
     @property
     def direct_bid_price(self) -> float:
@@ -102,6 +104,7 @@ class OrderBookSnapshot:
     direct_ask_qty: int
     bid_order_count: int
     ask_order_count: int
+    instrument_id: str = "ZN"
 
     def __post_init__(self) -> None:
         if self.bid <= 0 or self.ask <= 0:
@@ -119,15 +122,16 @@ class OrderBookSnapshot:
 
     @property
     def inside_bid(self) -> float:
-        return ZN_SEP26.round_price_to_tick(self.bid)
+        return get_instrument_spec(self.instrument_id).round_price_to_tick(self.bid)
 
     @property
     def inside_ask(self) -> float:
-        return ZN_SEP26.round_price_to_tick(self.ask)
+        return get_instrument_spec(self.instrument_id).round_price_to_tick(self.ask)
 
     @property
     def spread_ticks(self) -> float:
-        return ZN_SEP26.price_delta_to_ticks(self.ask - self.bid)
+        spec = get_instrument_spec(self.instrument_id)
+        return spec.price_delta_to_ticks(self.ask - self.bid)
 
     @property
     def direct_bid_price(self) -> float:
@@ -138,17 +142,22 @@ class OrderBookSnapshot:
         return self.ask
 
 
-def quote_from_level1(row: Level1MarketRow) -> Quote:
+def quote_from_level1(
+    row: Level1MarketRow,
+    instrument_id: str = "ZN",
+) -> Quote:
     """Build a ``Quote`` from explicit Level 1 ADL columns."""
+    spec = get_instrument_spec(instrument_id)
     return Quote(
         timestamp=row.timestamp,
-        bid=ZN_SEP26.round_price_to_tick(row.direct_bid_price),
-        ask=ZN_SEP26.round_price_to_tick(row.direct_ask_price),
+        bid=spec.round_price_to_tick(row.direct_bid_price),
+        ask=spec.round_price_to_tick(row.direct_ask_price),
         direct_bid_qty=row.direct_bid_qty,
         direct_ask_qty=row.direct_ask_qty,
         bid_order_count=row.bid_order_count,
         ask_order_count=row.ask_order_count,
         volume=row.volume,
+        instrument_id=spec.instrument_id,
     )
 
 
@@ -322,6 +331,7 @@ def order_book_from_quote(quote: Quote) -> OrderBookSnapshot:
         direct_ask_qty=quote.direct_ask_qty,
         bid_order_count=quote.bid_order_count,
         ask_order_count=quote.ask_order_count,
+        instrument_id=quote.instrument_id,
     )
 
 
@@ -370,24 +380,31 @@ def aggressive_fill_price(side: str, quote: Quote) -> float:
 
 
 class RollingStdTicks:
-    """Rolling std-dev of mid price changes expressed in ZN ticks (tick size 1/64)."""
+    """Rolling std-dev of mid price changes expressed in instrument ticks."""
 
-    def __init__(self, window: int, min_std_ticks: float = 0.5) -> None:
+    def __init__(
+        self,
+        window: int,
+        min_std_ticks: float = 0.5,
+        instrument_id: str = "ZN",
+    ) -> None:
         if window < 2:
             raise ValueError(f"window must be >= 2, got {window}")
         if min_std_ticks <= 0:
             raise ValueError(f"min_std_ticks must be positive, got {min_std_ticks}")
         self._window = window
         self._min_std_ticks = min_std_ticks
+        self._instrument_id = instrument_id
         self._deltas: list[float] = []
 
     @property
     def tick_size(self) -> float:
-        return TICK_SIZE_FLOAT
+        return get_instrument_spec(self._instrument_id).tick_size
 
     def update(self, mid: float, prev_mid: float | None) -> float:
+        spec = get_instrument_spec(self._instrument_id)
         if prev_mid is not None and prev_mid > 0:
-            delta_ticks = ZN_SEP26.price_delta_to_ticks(mid - prev_mid)
+            delta_ticks = spec.price_delta_to_ticks(mid - prev_mid)
             self._deltas.append(delta_ticks)
             if len(self._deltas) > self._window:
                 self._deltas.pop(0)

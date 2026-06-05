@@ -13,6 +13,7 @@ from zn_competition.strategies.volume_aware_mm import (
     OrderBookImbalanceHFT,
     scratch_net_pnl_usd,
 )
+from zn_competition.microstructure import Level1MarketRow, quote_from_level1
 from zn_competition.tests.level1_fixtures import BEARISH_L1, BULLISH_L1, l1_book, l1_quote
 
 
@@ -20,7 +21,7 @@ class TestOrderBookImbalance(unittest.TestCase):
     def test_direct_obi_formula(self) -> None:
         book = l1_book(BULLISH_L1)
         obi = calculate_order_book_imbalance(book)
-        self.assertAlmostEqual(obi, (110 - 10) / 120, places=6)
+        self.assertAlmostEqual(obi, (190 - 10) / 200, places=6)
         self.assertGreater(obi, OBI_ENTRY_THRESHOLD)
         self.assertEqual(book.direct_bid_price, BULLISH_L1.direct_bid_price)
         self.assertEqual(book.direct_ask_price, BULLISH_L1.direct_ask_price)
@@ -68,6 +69,23 @@ class TestOBIExecution(unittest.TestCase):
             scratch_net_pnl_usd(3),
             net_pnl_from_tick_move(0.0, 3, sides=2).net_pnl_usd,
         )
+
+    def test_thin_zn_book_blocks_obi_entry(self) -> None:
+        engine = OrderBookImbalanceHFT(quote_size=1)
+        ledger = PositionLedger()
+        thin = Level1MarketRow(
+            direct_bid_price=112.0,
+            direct_ask_price=112.03125,
+            direct_bid_qty=100,
+            direct_ask_qty=50,
+            bid_order_count=10,
+            ask_order_count=5,
+        )
+        book = l1_book(thin)
+        quote = quote_from_level1(thin)
+        result = engine.process_tick(quote, book, ledger)
+        self.assertEqual(result.action, "liquidity_dropout")
+        self.assertEqual(ledger.position, 0)
 
 
 if __name__ == "__main__":

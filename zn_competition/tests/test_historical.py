@@ -9,6 +9,7 @@ from zn_competition.execution import execute_signal
 from zn_competition.historical import (
     DEFAULT_ZN_MIN_DATA_PATH,
     generate_mock_order_book_stream,
+    load_min_csv,
     load_zn_min_csv,
     row_to_level1_dict,
     run_historical_loop,
@@ -99,7 +100,7 @@ class TestZnMinCsvParser(unittest.TestCase):
     def test_load_zn_min_csv_chronological(self) -> None:
         if not DEFAULT_ZN_MIN_DATA_PATH.is_file():
             self.skipTest("zn_min_data.csv not present")
-        quotes = load_zn_min_csv(DEFAULT_ZN_MIN_DATA_PATH)
+        quotes = load_min_csv(DEFAULT_ZN_MIN_DATA_PATH, instrument_id="ZN")
         self.assertGreater(len(quotes), 100)
         timestamps = [q.timestamp for q in quotes]
         self.assertEqual(timestamps, sorted(timestamps))

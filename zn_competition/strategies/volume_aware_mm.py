@@ -26,8 +26,9 @@ from zn_competition.specs import (
     FEE_PER_LOT_PER_SIDE_USD,
     FEE_PER_LOT_ROUND_TURN_USD,
     HIGH_IMPACT_MACRO_TAGS,
+    InstrumentSpec,
     MAX_POSITION_LOTS,
-    ZN_SEP26,
+    get_instrument_spec,
 )
 from zn_competition.strategies.base import Side, Signal, StrategyContext
 from zn_competition.strategies.obi_regime import (
@@ -144,6 +145,36 @@ class OrderBookImbalanceHFT:
             ask_order_count=ctx.ask_order_count,
         )
 
+    def _instrument_spec(self, book: OrderBookSnapshot) -> InstrumentSpec:
+        return get_instrument_spec(book.instrument_id)
+
+    def _liquidity_sufficient(self, book: OrderBookSnapshot) -> bool:
+        spec = self._instrument_spec(book)
+        return spec.liquidity_sufficient(book.direct_bid_qty, book.direct_ask_qty)
+
+    def _favorable_ticks(self, book: OrderBookSnapshot, trade: OpenOBITrade) -> float:
+        spec = self._instrument_spec(book)
+        if trade.side == Side.BUY:
+            return spec.price_delta_to_ticks(book.inside_bid - trade.entry_price)
+        return spec.price_delta_to_ticks(trade.entry_price - book.inside_ask)
+
+    def _exit_price_for_trade(
+        self,
+        book: OrderBookSnapshot,
+        trade: OpenOBITrade,
+    ) -> float:
+        spec = self._instrument_spec(book)
+        profit_ticks = spec.alpha_profit_buffer_ticks()
+        if profit_ticks <= 0:
+            return spec.round_price_to_tick(trade.entry_price)
+        if trade.side == Side.BUY:
+            return spec.round_price_to_tick(
+                trade.entry_price + spec.ticks_to_price_delta(profit_ticks)
+            )
+        return spec.round_price_to_tick(
+            trade.entry_price - spec.ticks_to_price_delta(profit_ticks)
+        )
+
     def on_tick(self, ctx: StrategyContext) -> Signal | None:
         """Signal-only path for strategy stack (no ledger mutation)."""
         if not self._session_ok(ctx):
@@ -153,7 +184,17 @@ class OrderBookImbalanceHFT:
         position = ctx.position
 
         if self._open_trade is not None:
-            if self._should_scratch(obi, self._open_trade):
+            if self._should_take_profit(book, self._open_trade):
+                spec = self._instrument_spec(book)
+                return Signal(
+                    side=Side.FLAT,
+                    size=self._open_trade.lots,
+                    urgency="aggressive",
+                    reason="obi_take_profit",
+                    expected_edge_ticks=float(spec.alpha_profit_buffer_ticks()),
+                    max_hold_seconds=1,
+                )
+            if self._should_scratch(obi, self._open_trade, book):
                 return Signal(
                     side=Side.FLAT,
                     size=self._open_trade.lots,
@@ -165,6 +206,9 @@ class OrderBookImbalanceHFT:
             return None
 
         if self._working_order is not None:
+            return None
+
+        if not self._liquidity_sufficient(book):
             return None
 
         if obi >= self.entry_threshold and position < MAX_POSITION_LOTS:
@@ -216,14 +260,24 @@ class OrderBookImbalanceHFT:
         position = ledger.position
 
         if self._open_trade is not None:
-            if self._should_scratch(obi, self._open_trade):
-                scratch_fills, pnl = self._execute_scratch(quote, book, ledger)
-                result.fills.extend(scratch_fills)
+            if self._should_take_profit(book, self._open_trade):
+                exit_fills, pnl = self._execute_profit_exit(quote, book, ledger)
+                result.fills.extend(exit_fills)
+                result.scratch_pnl_usd = pnl
+                result.action = "take_profit"
+                return result
+            if self._should_scratch(obi, self._open_trade, book):
+                exit_fills, pnl = self._execute_scratch(quote, book, ledger)
+                result.fills.extend(exit_fills)
                 result.scratch_pnl_usd = pnl
                 result.action = "scratch"
                 return result
 
         if self._working_order is not None:
+            if not self._liquidity_sufficient(book):
+                self._working_order = None
+                result.action = "liquidity_dropout"
+                return result
             fill = self._try_fill_working_order(quote, book, ledger, obi)
             if fill is not None:
                 result.fills.append(fill)
@@ -240,6 +294,10 @@ class OrderBookImbalanceHFT:
             return result
 
         if not self._allows_new_entries():
+            return result
+
+        if not self._liquidity_sufficient(book):
+            result.action = "liquidity_dropout"
             return result
 
         if obi >= self.entry_threshold and position < MAX_POSITION_LOTS:
@@ -282,12 +340,31 @@ class OrderBookImbalanceHFT:
             return False
         return True
 
-    def _should_scratch(self, obi: float, trade: OpenOBITrade) -> bool:
+    def _should_take_profit(self, book: OrderBookSnapshot, trade: OpenOBITrade) -> bool:
+        spec = self._instrument_spec(book)
+        profit_ticks = spec.alpha_profit_buffer_ticks()
+        if profit_ticks <= 0:
+            return False
+        return self._favorable_ticks(book, trade) >= profit_ticks
+
+    def _should_scratch(
+        self,
+        obi: float,
+        trade: OpenOBITrade,
+        book: OrderBookSnapshot,
+    ) -> bool:
+        flipped = False
         if trade.side == Side.BUY and obi <= self.flip_threshold:
+            flipped = True
+        elif trade.side == Side.SELL and obi >= -self.flip_threshold:
+            flipped = True
+        if not flipped:
+            return False
+        spec = self._instrument_spec(book)
+        profit_ticks = spec.alpha_profit_buffer_ticks()
+        if profit_ticks <= 0:
             return True
-        if trade.side == Side.SELL and obi >= -self.flip_threshold:
-            return True
-        return False
+        return self._favorable_ticks(book, trade) >= profit_ticks
 
     def _still_quoting_favorable(self, obi: float, side: Side) -> bool:
         if side == Side.BUY:
@@ -352,11 +429,12 @@ class OrderBookImbalanceHFT:
             self._working_order = None
             return None
 
+        spec = self._instrument_spec(book)
         if order.side == Side.BUY:
-            if abs(ZN_SEP26.round_price_to_tick(quote.bid) - order.limit_price) > 1e-9:
+            if abs(spec.round_price_to_tick(quote.bid) - order.limit_price) > 1e-9:
                 return None
         elif order.side == Side.SELL:
-            if abs(ZN_SEP26.round_price_to_tick(quote.ask) - order.limit_price) > 1e-9:
+            if abs(spec.round_price_to_tick(quote.ask) - order.limit_price) > 1e-9:
                 return None
         else:
             return None
@@ -384,29 +462,57 @@ class OrderBookImbalanceHFT:
         self._working_order = None
         return fill
 
+    def _execute_profit_exit(
+        self,
+        quote: Quote,
+        book: OrderBookSnapshot,
+        ledger: PositionLedger,
+    ) -> tuple[list[FillRecord], float]:
+        return self._execute_open_trade_exit(
+            quote,
+            book,
+            ledger,
+            reason="obi_take_profit",
+        )
+
     def _execute_scratch(
         self,
         quote: Quote,
         book: OrderBookSnapshot,
         ledger: PositionLedger,
     ) -> tuple[list[FillRecord], float]:
+        return self._execute_open_trade_exit(
+            quote,
+            book,
+            ledger,
+            reason="obi_scratch_flip",
+        )
+
+    def _execute_open_trade_exit(
+        self,
+        quote: Quote,
+        book: OrderBookSnapshot,
+        ledger: PositionLedger,
+        *,
+        reason: str,
+    ) -> tuple[list[FillRecord], float]:
         trade = self._open_trade
         if trade is None:
             return [], 0.0
 
+        spec = self._instrument_spec(book)
         exit_side = Side.SELL if trade.side == Side.BUY else Side.BUY
-        exit_price = ZN_SEP26.round_price_to_tick(trade.entry_price)
-
-        if exit_side == Side.SELL:
-            validate_order(
-                ledger.position,
-                OrderRequest(Side.SELL, trade.lots, reason="obi_scratch_flip"),
-            )
+        exit_price = self._exit_price_for_trade(book, trade)
+        profit_ticks = spec.alpha_profit_buffer_ticks()
+        if profit_ticks > 0:
+            tick_move = float(profit_ticks)
         else:
-            validate_order(
-                ledger.position,
-                OrderRequest(Side.BUY, trade.lots, reason="obi_scratch_flip"),
-            )
+            tick_move = 0.0
+
+        validate_order(
+            ledger.position,
+            OrderRequest(exit_side, trade.lots, reason=reason),
+        )
 
         exit_fill = FillRecord(
             side=exit_side,
@@ -414,12 +520,20 @@ class OrderBookImbalanceHFT:
             price=exit_price,
             fee_usd=trade.lots * FEE_PER_LOT_PER_SIDE_USD,
             timestamp=quote.timestamp,
-            reason="obi_scratch_flip",
+            reason=reason,
         )
         ledger.apply_fill(exit_fill)
         self._open_trade = None
         self._working_order = None
-        return [exit_fill], scratch_net_pnl_usd(trade.lots)
+        pnl = net_pnl_from_tick_move(
+            tick_move,
+            trade.lots,
+            sides=2,
+            instrument_id=spec.instrument_id,
+        ).net_pnl_usd
+        if profit_ticks <= 0:
+            pnl = scratch_net_pnl_usd(trade.lots)
+        return [exit_fill], pnl
 
     def sync_open_trade_from_ledger(self, ledger: PositionLedger) -> None:
         """Reconcile internal state when ledger already holds OBI inventory."""

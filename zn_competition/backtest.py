@@ -17,7 +17,7 @@ from pathlib import Path
 
 from zn_competition.economics import FeeAccounting, analyze_week_plan
 from zn_competition.features import MicrostructureFeatureEngine
-from zn_competition.historical import DEFAULT_ZN_MIN_DATA_PATH, load_zn_min_csv
+from zn_competition.historical import load_min_csv, load_zn_min_csv
 from zn_competition.microstructure import (
     Level1MarketRow,
     Quote,
@@ -29,8 +29,9 @@ from zn_competition.risk import FillRecord, PositionLedger, RiskState
 from zn_competition.specs import (
     FEE_PER_LOT_PER_SIDE_USD,
     FEE_PER_LOT_ROUND_TURN_USD,
-    TICK_SIZE_FLOAT,
-    ZN_SEP26,
+    InstrumentSpec,
+    get_instrument_spec,
+    resolve_min_data_path,
     weekly_volume_requirement,
 )
 from zn_competition.strategies.alpha_volume_platform import (
@@ -46,6 +47,8 @@ from zn_competition.strategies.volume_aware_mm import (
     SniperOBIEngine,
     VolumeAwareMarketMaking,
 )
+
+RESULTS_DIR = Path(__file__).resolve().parent / "results"
 
 REQUIRED_PRICE_COLUMNS_ANY = (
     frozenset({"bid", "ask"}),
@@ -103,6 +106,7 @@ class FillPnLLine:
 
 @dataclass(frozen=True)
 class BacktestResult:
+    instrument_id: str
     week: int
     leg_lots_traded: int
     weekly_min_legs: int
@@ -337,7 +341,7 @@ def _record_fills_on_ledger(
     cumulative_realized_start: float,
 ) -> tuple[int, float]:
     """Replay fills from a snapshot for per-leg net P&L attribution."""
-    scratch = PositionLedger()
+    scratch = PositionLedger(instrument=ledger.instrument)
     scratch.position = snap.position
     scratch.avg_entry_price = snap.avg_entry_price
     cumulative = cumulative_realized_start
@@ -400,6 +404,7 @@ def _flatten_at_market(
     ledger: PositionLedger,
     quote: Quote,
     reason: str,
+    spec: InstrumentSpec,
 ) -> FillRecord | None:
     """Aggressive flatten at inside market (sell @ bid / buy @ ask)."""
     if ledger.position == 0:
@@ -407,10 +412,10 @@ def _flatten_at_market(
     lots = abs(ledger.position)
     if ledger.position > 0:
         side = Side.SELL
-        price = ZN_SEP26.round_price_to_tick(quote.bid)
+        price = spec.round_price_to_tick(quote.bid)
     else:
         side = Side.BUY
-        price = ZN_SEP26.round_price_to_tick(quote.ask)
+        price = spec.round_price_to_tick(quote.ask)
     return FillRecord(
         side=side,
         lots=lots,
@@ -428,9 +433,10 @@ def _apply_mandatory_flatten(
     fill_index: int,
     pnl_lines: list[FillPnLLine],
     vamm: OrderBookImbalanceHFT | None,
+    spec: InstrumentSpec,
 ) -> int:
     """Flatten open inventory and record P&L; reset OBI engine state."""
-    fill = _flatten_at_market(ledger, quote, reason)
+    fill = _flatten_at_market(ledger, quote, reason, spec)
     if fill is None:
         return fill_index
     if vamm is not None:
@@ -451,17 +457,19 @@ def run_backtest(
     use_dual_regime: bool | None = None,
     use_alpha_volume_platform: bool | None = None,
     sniper_threshold: float = SNIPER_OBI_THRESHOLD_DEFAULT,
+    instrument_id: str = "ZN",
 ) -> BacktestResult:
     if week < 1 or week > 4:
         raise ValueError(f"week must be 1–4, got {week}")
+    spec = get_instrument_spec(instrument_id)
     if quotes is None:
-        quotes = load_zn_min_csv(csv_path or DEFAULT_ZN_MIN_DATA_PATH)
+        quotes = load_min_csv(csv_path, instrument_id=spec.instrument_id)
     if not quotes:
         raise ValueError("quotes list is empty")
 
     weekly_min = weekly_volume_requirement(week)
-    feature_engine = MicrostructureFeatureEngine()
-    ledger = PositionLedger()
+    feature_engine = MicrostructureFeatureEngine(instrument_id=spec.instrument_id)
+    ledger = PositionLedger(instrument=spec)
     risk = RiskState(daily_loss_limit_usd=daily_loss_limit_usd)
     signals_by_reason: dict[str, int] = {}
     actions_by_engine: dict[str, int] = {}
@@ -497,6 +505,8 @@ def run_backtest(
         "churn_pulses": 0,
         "churn_cycles_complete": 0,
         "obi_blocks_churn": 0,
+        "liquidity_dropouts": 0,
+        "alpha_take_profits": 0,
     }
 
     platform: AlphaVolumePlatform | None = None
@@ -510,7 +520,10 @@ def run_backtest(
                 short_entry_threshold=-obi_entry_threshold,
             )
         elif alpha_volume:
-            platform = AlphaVolumePlatform.with_sniper_threshold(sniper_threshold)
+            platform = AlphaVolumePlatform.with_sniper_threshold(
+                sniper_threshold,
+                instrument_id=spec.instrument_id,
+            )
             vamm = platform.alpha
         elif dual_regime:
             vamm = DualRegimeOBIEngine()
@@ -602,6 +615,10 @@ def run_backtest(
                         platform_stats["churn_cycles_complete"] += 1
                     if step.volume and step.volume.action == "obi_priority_block":
                         platform_stats["obi_blocks_churn"] += 1
+                    if step.alpha.action == "liquidity_dropout":
+                        platform_stats["liquidity_dropouts"] += 1
+                    if step.alpha.action == "take_profit":
+                        platform_stats["alpha_take_profits"] += 1
                     if all_fills:
                         fill_index, _ = _record_fills_on_ledger(
                             ledger,
@@ -681,6 +698,7 @@ def run_backtest(
                 fill_index,
                 pnl_lines,
                 vamm if use_volume_aware_mm and vamm is not None else None,
+                spec,
             )
             if len(ledger.fills) > fills_before:
                 risk.apply_realized(ledger.realized_pnl_usd - realized_before)
@@ -710,6 +728,7 @@ def run_backtest(
     mark_pnl = ledger.mark_price_pnl_usd(quotes[-1].mid)
 
     result = BacktestResult(
+        instrument_id=spec.instrument_id,
         week=week,
         leg_lots_traded=ledger.leg_lots_traded,
         weekly_min_legs=weekly_min,
@@ -735,34 +754,137 @@ def run_backtest(
     return result
 
 
-def print_alpha_volume_summary(result: BacktestResult) -> None:
-    """Console summary for Alpha Sniper + Module 4 Volume Churner backtest."""
-    print("=" * 60)
-    print("  Alpha Sniper + Volume Churner — Backtest Summary")
-    print("=" * 60)
-    print(f"  Total Lots Traded:       {result.leg_lots_traded}")
-    print(f"  Weekly Min (legs):       {result.weekly_min_legs}")
-    print(f"  Met Volume Minimum:      {result.met_volume_min}")
-    print(f"  Gross P&L (USD):         ${result.gross_pnl_usd:,.2f}")
-    print(f"  Total Commission:        ${result.total_fees_usd:,.2f}")
-    print(f"  Net P&L (USD):           ${result.net_pnl_usd:,.2f}")
-    print(f"  Position at EOF:         {result.position_end}")
+def format_alpha_volume_summary(result: BacktestResult) -> str:
+    """Text summary for Alpha Sniper + Module 4 Volume Churner backtest."""
+    spec = get_instrument_spec(result.instrument_id)
+    lines = [
+        "=" * 60,
+        "  Alpha Sniper + Volume Churner — Backtest Summary",
+        "=" * 60,
+        f"  Instrument:              {result.instrument_id} ({spec.tt_instrument})",
+        f"  Tick size / value:       {spec.tick_size} / ${spec.tick_value}",
+        f"  Total Lots Traded:       {result.leg_lots_traded}",
+        f"  Weekly Min (legs):       {result.weekly_min_legs}",
+        f"  Met Volume Minimum:      {result.met_volume_min}",
+        f"  Gross P&L (USD):         ${result.gross_pnl_usd:,.2f}",
+        f"  Total Commission:        ${result.total_fees_usd:,.2f}",
+        f"  Net P&L (USD):           ${result.net_pnl_usd:,.2f}",
+        f"  Position at EOF:         {result.position_end}",
+    ]
     if result.alpha_volume_stats:
         s = result.alpha_volume_stats
-        print("-" * 60)
-        print(f"  Sniper OBI threshold:    {s.get('sniper_threshold', 'n/a')}")
-        print(f"  Alpha (OBI) fill legs:   {s.get('alpha_fills', 0)}")
-        print(f"  Volume churn fill legs:  {s.get('volume_fills', 0)}")
-        print(f"  Churn generator pulses:  {s.get('churn_pulses', 0)}")
-        print(f"  Churn cycles complete:   {s.get('churn_cycles_complete', 0)}")
-        print(f"  OBI blocked churn ticks: {s.get('obi_blocks_churn', 0)}")
+        lines.extend(
+            [
+                "-" * 60,
+                f"  Sniper OBI threshold:    {s.get('sniper_threshold', 'n/a')}",
+                f"  Alpha (OBI) fill legs:   {s.get('alpha_fills', 0)}",
+                f"  Volume churn fill legs:  {s.get('volume_fills', 0)}",
+                f"  Churn generator pulses:  {s.get('churn_pulses', 0)}",
+                f"  Churn cycles complete:   {s.get('churn_cycles_complete', 0)}",
+                f"  OBI blocked churn ticks: {s.get('obi_blocks_churn', 0)}",
+                f"  Liquidity dropouts:      {s.get('liquidity_dropouts', 0)}",
+                f"  Alpha take-profits:      {s.get('alpha_take_profits', 0)}",
+                f"  Min combined L1 qty:     {spec.min_combined_volume}",
+                f"  Min alpha profit ticks:  {spec.min_alpha_profit_ticks}",
+            ]
+        )
     if result.dual_regime_stats:
         stats = result.dual_regime_stats
-        print("-" * 60)
-        print("  (legacy dual-regime stats)")
-        print(f"  Sniper window bars:      {stats.get('sniper_bars', 0)}")
-        print(f"  Volume window bars:      {stats.get('volume_bars', 0)}")
-    print("=" * 60)
+        lines.extend(
+            [
+                "-" * 60,
+                "  (legacy dual-regime stats)",
+                f"  Sniper window bars:      {stats.get('sniper_bars', 0)}",
+                f"  Volume window bars:      {stats.get('volume_bars', 0)}",
+            ]
+        )
+    lines.append("=" * 60)
+    return "\n".join(lines)
+
+
+def print_alpha_volume_summary(result: BacktestResult) -> None:
+    """Console summary for Alpha Sniper + Module 4 Volume Churner backtest."""
+    print(format_alpha_volume_summary(result))
+
+
+def format_backtest_report(
+    result: BacktestResult,
+    *,
+    csv_path: Path | str | None = None,
+    run_at: datetime | None = None,
+) -> str:
+    """Full backtest report text (summary, JSON, fee checks, curve)."""
+    run_at = run_at or datetime.now().astimezone()
+    spec = get_instrument_spec(result.instrument_id)
+    data_path = str(csv_path) if csv_path is not None else str(
+        resolve_min_data_path(result.instrument_id)
+    )
+    plan = analyze_week_plan(result.week, result.leg_lots_traded)
+    fees = FeeAccounting(
+        result.leg_lots_traded,
+        instrument_id=result.instrument_id,
+    )
+
+    sections = [
+        "Backtest Report",
+        f"Generated:    {run_at.isoformat(timespec='seconds')}",
+        f"Instrument:   {result.instrument_id} ({spec.tt_instrument})",
+        f"Week:         {result.week}",
+        f"Data CSV:     {data_path}",
+        "",
+        format_alpha_volume_summary(result),
+        "",
+        result.to_json(),
+        "",
+        f"week_plan: {plan}",
+        f"fee_accounting: {asdict(fees)}",
+        (
+            f"fee_per_rt_check: {result.leg_lots_traded} legs, "
+            f"${result.total_fees_usd} fees "
+            f"(expected ${result.leg_lots_traded * FEE_PER_LOT_PER_SIDE_USD}, "
+            f"RT=${FEE_PER_LOT_ROUND_TURN_USD}/lot)"
+        ),
+    ]
+
+    if result.signals_by_reason:
+        sections.extend(["", f"signals_by_reason: {result.signals_by_reason}"])
+    if result.actions_by_engine:
+        sections.append(f"actions_by_engine: {result.actions_by_engine}")
+
+    if result.net_pnl_curve:
+        first = result.net_pnl_curve[0]
+        last = result.net_pnl_curve[-1]
+        sections.append(
+            f"net_pnl_curve: {len(result.net_pnl_curve)} bars, "
+            f"start=${first.cumulative_net_pnl_usd:.2f}, "
+            f"end=${last.cumulative_net_pnl_usd:.2f}"
+        )
+
+    if result.halted:
+        sections.append(f"halted: {result.halt_reason}")
+
+    return "\n".join(sections)
+
+
+def save_backtest_report(
+    result: BacktestResult,
+    *,
+    csv_path: Path | str | None = None,
+    results_dir: Path | None = None,
+    run_at: datetime | None = None,
+) -> Path:
+    """Write full backtest report to ``results/`` with a timestamped filename."""
+    run_at = run_at or datetime.now().astimezone()
+    out_dir = results_dir or RESULTS_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = run_at.strftime("%Y%m%d_%H%M%S")
+    filename = f"{result.instrument_id}_week{result.week}_{stamp}.txt"
+    out_path = out_dir / filename
+    out_path.write_text(
+        format_backtest_report(result, csv_path=csv_path, run_at=run_at),
+        encoding="utf-8",
+    )
+    return out_path
 
 
 def print_dual_regime_summary(result: BacktestResult) -> None:
@@ -770,34 +892,51 @@ def print_dual_regime_summary(result: BacktestResult) -> None:
     print_alpha_volume_summary(result)
 
 
-def run_backtest_csv(path: Path, week: int = 1) -> BacktestResult:
-    quotes = load_zn_min_csv(path)
+def run_backtest_csv(
+    path: Path,
+    week: int = 1,
+    instrument_id: str = "ZN",
+) -> BacktestResult:
+    quotes = load_min_csv(path, instrument_id=instrument_id)
     event_rows: list[dict[str, str]] = []
     with path.open(newline="", encoding="utf-8-sig") as handle:
         reader = csv.DictReader(handle)
         if reader.fieldnames:
             for row in reader:
                 event_rows.append(row)
-    return run_backtest(quotes, week=week, event_rows=event_rows)
+    return run_backtest(
+        quotes,
+        week=week,
+        event_rows=event_rows,
+        instrument_id=instrument_id,
+    )
 
 
-def generate_synthetic_quotes(count: int = 500, base_price: float = 112.0) -> list[Quote]:
-    """Deterministic synthetic stream for offline validation (no external data)."""
+_ZN_SYNTHETIC_BASE_PRICE = 112.0
+
+
+def generate_synthetic_quotes(
+    count: int = 500,
+    base_price: float | None = None,
+    instrument_id: str = "ZN",
+) -> list[Quote]:
+    """Deterministic ZN synthetic stream for offline validation (no external data)."""
     if count < 10:
         raise ValueError("count must be >= 10")
+    spec = get_instrument_spec(instrument_id)
+    mid = base_price if base_price is not None else _ZN_SYNTHETIC_BASE_PRICE
     quotes: list[Quote] = []
-    mid = base_price
     for i in range(count):
-        drift = ((i % 17) - 8) * (1 / 64) * 0.1
-        mid = max(100.0, mid + drift)
-        half_spread = max(TICK_SIZE_FLOAT / 2, 1 / 128)
-        direct_bid = ZN_SEP26.round_price_to_tick(mid - half_spread)
-        direct_ask = ZN_SEP26.round_price_to_tick(mid + half_spread)
+        drift = ((i % 17) - 8) * spec.tick_size * 0.1
+        mid = max(spec.tick_size, mid + drift)
+        half_spread = max(spec.tick_size / 2.0, spec.tick_size)
+        direct_bid = spec.round_price_to_tick(mid - half_spread)
+        direct_ask = spec.round_price_to_tick(mid + half_spread)
         if direct_ask <= direct_bid:
-            direct_ask = ZN_SEP26.round_price_to_tick(direct_bid + TICK_SIZE_FLOAT)
+            direct_ask = spec.round_price_to_tick(direct_bid + spec.tick_size)
         row = Level1MarketRow(
-            direct_bid_price=round(direct_bid, 6),
-            direct_ask_price=round(direct_ask, 6),
+            direct_bid_price=direct_bid,
+            direct_ask_price=direct_ask,
             direct_bid_qty=20 + (i % 5),
             direct_ask_qty=18 + (i % 7),
             bid_order_count=3 + (i % 4),
@@ -805,37 +944,33 @@ def generate_synthetic_quotes(count: int = 500, base_price: float = 112.0) -> li
             timestamp=f"2026-06-03T14:{i % 60:02d}:00+00:00",
             volume=1 + (i % 3),
         )
-        quotes.append(quote_from_level1(row))
+        quotes.append(quote_from_level1(row, instrument_id=spec.instrument_id))
     return quotes
 
 
 if __name__ == "__main__":
     import sys
 
-    if len(sys.argv) > 1:
-        result = run_backtest_csv(
-            Path(sys.argv[1]),
-            week=int(sys.argv[2]) if len(sys.argv) > 2 else 1,
-        )
+    week = 1
+    csv_path: Path | None = None
+
+    for arg in sys.argv[1:]:
+        if arg.endswith(".csv"):
+            csv_path = Path(arg)
+        elif arg.isdigit():
+            week = int(arg)
+
+    resolved_csv = csv_path or resolve_min_data_path("ZN")
+    if csv_path is not None:
+        result = run_backtest_csv(csv_path, week=week, instrument_id="ZN")
     else:
-        result = run_backtest(week=1, use_alpha_volume_platform=True)
+        result = run_backtest(
+            week=week,
+            instrument_id="ZN",
+            csv_path=resolved_csv,
+            use_alpha_volume_platform=True,
+        )
+    report_path = save_backtest_report(result, csv_path=resolved_csv)
     print_alpha_volume_summary(result)
     print()
-    print(result.to_json())
-    plan = analyze_week_plan(1, result.leg_lots_traded)
-    print("week_plan:", plan)
-    print("fee_accounting:", asdict(FeeAccounting(result.leg_lots_traded)))
-    print(
-        f"fee_per_rt_check: {result.leg_lots_traded} legs, "
-        f"${result.total_fees_usd} fees "
-        f"(expected ${result.leg_lots_traded * FEE_PER_LOT_PER_SIDE_USD}, "
-        f"RT=${FEE_PER_LOT_ROUND_TURN_USD}/lot)"
-    )
-    if result.net_pnl_curve:
-        first = result.net_pnl_curve[0]
-        last = result.net_pnl_curve[-1]
-        print(
-            f"net_pnl_curve: {len(result.net_pnl_curve)} bars, "
-            f"start=${first.cumulative_net_pnl_usd:.2f}, "
-            f"end=${last.cumulative_net_pnl_usd:.2f}"
-        )
+    print(f"Full report saved: {report_path}")

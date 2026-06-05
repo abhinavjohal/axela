@@ -18,7 +18,7 @@ from zn_competition.microstructure import (
     RollingStdTicks,
     order_book_from_quote,
 )
-from zn_competition.specs import CT, ZN_SEP26, in_liquidity_window
+from zn_competition.specs import CT, get_instrument_spec, in_liquidity_window
 
 FEATURE_TABLE_COLUMNS: tuple[str, ...] = (
     "timestamp",
@@ -95,6 +95,7 @@ class MicrostructureFeatureEngine:
     vol_window: int = 120
     z_std_floor_ticks: float = 0.5
     obi_history_length: int = 500
+    instrument_id: str = "ZN"
 
     _session: SessionVWAP = field(default_factory=SessionVWAP)
     _vol_estimator: RollingStdTicks = field(init=False)
@@ -106,6 +107,7 @@ class MicrostructureFeatureEngine:
         self._vol_estimator = RollingStdTicks(
             self.vol_window,
             min_std_ticks=self.z_std_floor_ticks,
+            instrument_id=self.instrument_id,
         )
         self._obi_history = OBIHistoryBuffer(max_length=self.obi_history_length)
 
@@ -147,7 +149,8 @@ class MicrostructureFeatureEngine:
         std_ticks = self._vol_estimator.update(mid, self._prev_mid)
         self._prev_mid = mid
 
-        deviation_ticks = ZN_SEP26.price_delta_to_ticks(mid - vwap)
+        spec = get_instrument_spec(self.instrument_id)
+        deviation_ticks = spec.price_delta_to_ticks(mid - vwap)
         safe_std = max(std_ticks, self.z_std_floor_ticks)
         vwap_z = deviation_ticks / safe_std
 
